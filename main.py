@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
+# from ultralytics import YOLO  # Artık VisionPipeline içinde
+from vision_pipeline import VisionPipeline
 import threading
 from queue import Queue
 import time
@@ -348,17 +349,13 @@ def main():
     time.sleep(2)  # Test sesinin bitmesini bekle
     print("Ses sistemi hazir!")
     
-    # YOLOv11 modelini yükle
-    # İlk çalıştırmada model otomatik indirilecektir
-    print("YOLO modeli yukleniyor...")
+    # YOLOv11 modelini yükle (VisionPipeline üzerinden)
+    print("Vision Pipeline baslatiliyor...")
     try:
-        model = YOLO("../models/yolo11n.pt")  # nano model (hızlı)
-        # Alternatifler: yolo11s.pt (small), yolo11m.pt (medium), yolo11l.pt (large), yolo11x.pt (extra large)
-        # YOLOv8 kullanmak için: YOLO("yolov8n.pt")
-        print("Model basariyla yuklendi!")
+        pipeline = VisionPipeline("../models/yolo11n.pt")
+        print("Pipeline hazir!")
     except Exception as e:
-        print(f"Model yuklenirken hata: {e}")
-        print("Lutfen 'pip install ultralytics' komutunu calistirin.")
+        print(f"Pipeline baslatma hatasi: {e}")
         return
     
     # Kamerayı aç
@@ -391,53 +388,55 @@ def main():
         frame_count += 1
         frame_height, frame_width = frame.shape[:2]
         
-        # YOLO inference
-        results = model(frame, verbose=False, conf=0.4)  # confidence threshold: 0.4
+        # Vision Pipeline ile işle (YOLO + Canny + IPM + Free Space)
+        combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
+        
+        # Free Space Maskesini BEV görüntüsüne yeşil overlay olarak ekle
+        # Maskenin beyaz olduğu yerleri (boş alanları) yeşil yap
+        free_space_overlay = np.zeros_like(bev_view)
+        free_space_overlay[free_space_mask > 0] = [0, 255, 0]
+        
+        # BEV görüntüsü ile karıştır
+        bev_combined = cv2.addWeighted(bev_view, 0.7, free_space_overlay, 0.3, 0)
         
         # Tespit edilen engelleri topla
         obstacles = []
         
-        for result in results:
-            boxes = result.boxes
-            if boxes is not None:
-                for box in boxes:
-                    # Bounding box koordinatları
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    confidence = float(box.conf[0])
-                    class_id = int(box.cls[0])
-                    class_name = model.names[class_id]
-                    
-                    # Tüm tespit edilen nesneler engel kabul edilecek
-                    obstacles.append((x1, y1, x2, y2))
-                    
-                    # Mesafe tahmini
-                    bbox_height = y2 - y1
-                    distance, dist_category = estimate_distance(bbox_height, frame_height)
-                    
-                    # Mesafeye göre renk belirle
-                    if dist_category == "YAKIN":
-                        box_color = (0, 0, 255)  # Kırmızı - tehlikeli
-                    elif dist_category == "ORTA":
-                        box_color = (0, 165, 255)  # Turuncu - dikkat
-                    else:
-                        box_color = (0, 255, 0)  # Yeşil - güvenli
-                    
-                    # Bounding box çiz
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                    
-                    # Etiket (mesafe ile birlikte)
-                    label = f"{class_name}: {distance:.1f}m"
-                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                    cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
-                                  (x1 + label_size[0], y1), box_color, -1)
-                    cv2.putText(frame, label, (x1, y1 - 5), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        for item in pipeline_obstacles:
+            x1, y1, x2, y2, class_name, confidence = item
+            
+            # Tüm tespit edilen nesneler engel kabul edilecek
+            obstacles.append((x1, y1, x2, y2))
+            
+            # Mesafe tahmini
+            bbox_height = y2 - y1
+            distance, dist_category = estimate_distance(bbox_height, frame_height)
+            
+            # Mesafeye göre renk belirle
+            if dist_category == "YAKIN":
+                box_color = (0, 0, 255)  # Kırmızı - tehlikeli
+            elif dist_category == "ORTA":
+                box_color = (0, 165, 255)  # Turuncu - dikkat
+            else:
+                box_color = (0, 255, 0)  # Yeşil - güvenli
+            
+            # Bounding box çiz (Combined view üzerine)
+            cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
+            
+            # Etiket (mesafe ile birlikte)
+            label = f"{class_name}: {distance:.1f}m"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(combined_view, (x1, y1 - label_size[1] - 10), 
+                          (x1 + label_size[0], y1), box_color, -1)
+            cv2.putText(combined_view, label, (x1, y1 - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
         # En yakın engeli bul
         min_distance, closest_category, closest_bbox = get_closest_obstacle(obstacles, frame_height)
         
-        # Yön hesapla
-        direction = get_direction(obstacles, frame_width, frame_height)
+        # Yön hesapla (Yeni Algoritma: Free Space Maskesi üzerinden)
+        direction = pipeline.find_best_direction(free_space_mask)
+        # Eski yöntem: direction = get_direction(obstacles, frame_width, frame_height)
         
         # Cooldown azalt
         if speech_cooldown > 0:
@@ -467,19 +466,19 @@ def main():
             speech_cooldown = 90  # 90 kare (yaklaşık 3 saniye) cooldown
         
         # Bölgeleri ve yönü çiz
-        frame = draw_regions(frame, direction)
+        combined_view = draw_regions(combined_view, direction)
         
         # Mesafe bilgisi göster
         if min_distance is not None:
             distance_color = (0, 0, 255) if closest_category == "YAKIN" else (0, 255, 255) if closest_category == "ORTA" else (0, 255, 0)
-            cv2.putText(frame, f"En Yakin: {min_distance:.1f}m", (10, frame_height - 50), 
+            cv2.putText(combined_view, f"En Yakin: {min_distance:.1f}m", (10, frame_height - 50), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, distance_color, 2)
         else:
-            cv2.putText(frame, "En Yakin: Yok", (10, frame_height - 50), 
+            cv2.putText(combined_view, "En Yakin: Yok", (10, frame_height - 50), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # Engel sayısını göster
-        cv2.putText(frame, f"Engel Sayisi: {len(obstacles)}", (10, frame_height - 20), 
+        cv2.putText(combined_view, f"Engel Sayisi: {len(obstacles)}", (10, frame_height - 20), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # FPS göster (her 30 karede bir)
@@ -488,7 +487,8 @@ def main():
             print(f"Kare: {frame_count} | Engel: {len(obstacles)} | Yon: {direction} | Mesafe: {dist_str}")
         
         # Görüntüyü göster
-        cv2.imshow("YOLOv11 Engel Tespit - Yon Belirleme", frame)
+        cv2.imshow("YOLOv11 Engel Tespit - Yon Belirleme", combined_view)
+        cv2.imshow("Kus Bakisi (BEV) - Free Space", bev_combined)
         
         # Çıkış için 'q' tuşu
         if cv2.waitKey(1) & 0xFF == ord('q'):

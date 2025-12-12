@@ -54,7 +54,8 @@ class NavigationService(BaseService):
             
             # Pipeline işlemi
             try:
-                combined_view, obstacles, edges, bev_view, free_space_mask = self.pipeline.process_frame(frame)
+                # Yeni Pipeline Çıktısı: combined_view, obstacles, fusion_map, bev_fusion, free_space_mask, depth_colormap
+                combined_view, obstacles, fusion_map, bev_fusion, free_space_mask, depth_colormap = self.pipeline.process_frame(frame)
                 
                 # Yön bulma
                 direction = self.pipeline.find_best_direction(free_space_mask)
@@ -96,8 +97,10 @@ class NavigationService(BaseService):
                         speech_cooldown = 90 # 3 saniye
                 
                 # Görselleştirme (Opsiyonel - Headless modda kapatılabilir)
-                cv2.imshow("Navigasyon", combined_view)
-                cv2.imshow("BEV", bev_view)
+                cv2.imshow("Navigasyon (Fusion)", combined_view)
+                cv2.imshow("BEV (Fusion)", bev_fusion)
+                if depth_colormap is not None:
+                    cv2.imshow("Depth (MiDaS)", depth_colormap)
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.running = False

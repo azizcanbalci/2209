@@ -42,29 +42,27 @@ Görme engelli kullanıcılar için mevcut çözümler ya çok pahalı (lidar ta
 
 ## 📄 System Patterns
 
-**Sistem Mimarisi**
+**Sistem Mimarisi (Modüler Servis Yapısı)**
 
-1. Görüntü Yakalama
-2. YOLO İşleme (Obstacle Detection)
-3. Edge Detection + IPM (Free-Space Extraction)
-4. Mask Birleştirme → ObstacleMap
-5. Koridor Hesaplama (Path Planning)
-6. Karar Üretme (Rule-Based Planner)
-7. Sesli Yönlendirme
+Sistem, genişletilebilirliği artırmak için modüler bir servis mimarisine (Microservices-like) dönüştürülmüştür.
+
+1.  **App (Orchestrator):** Ana kontrolcü. Sesli komutları dinler ve ilgili servisleri başlatır/durdurur.
+2.  **VoiceService:** Mikrofonu dinler, Speech-to-Text (STT) yapar ve komutları metne çevirir.
+3.  **AudioService:** Metinleri sese çevirir (TTS) ve çalar.
+4.  **NavigationService:** Görüntü işleme pipeline'ını (YOLO+IPM) çalıştırır ve yönlendirme yapar.
 
 **Ana Desenler**
 
-- Perception → Planning pipeline
-- Free-space segmentation
-- Column scanning corridor detection
-- Rule-based decision making
+- **Service-Based Architecture:** Her özellik bağımsız bir servis sınıfıdır (`BaseService`'den türetilir).
+- **Event-Driven:** Sesli komutlar birer olay (event) olarak işlenir.
+- **Threaded Execution:** Her servis kendi thread'inde çalışır, böylece ana döngü bloklanmaz.
 
 **Kritik İş Akışları**
 
-- YOLO kutularını free-space maskesi üzerine bindirme
-- BEV (bird-eye view) üretimi
-- En geniş boş alanı bulma
-- Yakın engel alarmı
+1.  Kullanıcı "Navigasyon Başlat" der.
+2.  `VoiceService` komutu algılar ve `App`'e iletir.
+3.  `App`, `NavigationService`'i başlatır.
+4.  `NavigationService` kamerayı açar, `VisionPipeline`'ı çalıştırır ve `AudioService` üzerinden yönlendirme yapar.
 
 ## 📄 Tech Context
 

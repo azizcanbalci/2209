@@ -1,67 +1,65 @@
-# YOLOv11 Engel Tespit ve Yön Belirleme Sistemi
+# Blind Assist - Gelişmiş Engel Tespit ve Yönlendirme Sistemi
 
-Kameradan gelen görüntüdeki engelleri tespit eder ve güvenli yönü belirler.
+Bu proje, görme engelli bireyler için geliştirilmiş, bilgisayarlı görü (computer vision) tabanlı bir yardımcı asistan prototipidir. **YOLOv11** nesne tespiti, **Canny Kenar Tespiti** ve **Inverse Perspective Mapping (IPM)** tekniklerini birleştirerek çevreyi analiz eder ve kullanıcıya en güvenli yürüme rotasını sesli olarak bildirir.
 
-## Kurulum
+## 🚀 Özellikler
 
-```powershell
-pip install -r requirements.txt
-```
+- **Hibrit Algılama:** YOLOv11 ile nesne tespiti ve Canny Edge Detection ile yol sınırlarının belirlenmesi.
+- **Kuş Bakışı Görünüm (BEV):** IPM (Inverse Perspective Mapping) ile kamera görüntüsünün kuş bakışı haritaya dönüştürülmesi.
+- **Free-Space Analizi:** Yürünebilir güvenli alanların (Free Space) dinamik olarak hesaplanması.
+- **Akıllı Yönlendirme:** Sadece engellere değil, boş alanın genişliğine ve sürekliliğine göre karar veren gelişmiş algoritma.
+- **Sesli Geri Bildirim:** Türkçe sesli komutlar ("Sola dön", "Düz git", "Dikkat! Çok yakın engel" vb.).
+- **Mesafe Tahmini:** Engellerin uzaklığının tahmini ve renk kodlu uyarı sistemi.
 
-## Çalıştırma
+## 🛠️ Kurulum
+
+1.  Gerekli kütüphaneleri yükleyin:
+
+    ```powershell
+    pip install -r requirements.txt
+    ```
+
+2.  PyTorch ve GPU desteği (Opsiyonel ama önerilir):
+    Sistem CPU üzerinde çalışabilir ancak daha yüksek FPS için CUDA destekli PyTorch önerilir.
+
+## ▶️ Çalıştırma
+
+Uygulamayı başlatmak için:
 
 ```powershell
 python main.py
 ```
 
-## Özellikler
+Çıkış yapmak için `q` tuşuna basabilirsiniz.
 
-- **YOLOv11/YOLOv8** ile gerçek zamanlı engel tespiti
-- Tüm nesneler engel olarak kabul edilir (insan, araba, bisiklet, vb.)
-- Bounding box görselleştirme
-- 3 bölge analizi (SOL, ORTA, SAĞ)
-- Güvenli yön belirleme (DÜZ, SOL, SAĞ, DUR)
+## 🏗️ Sistem Mimarisi
 
-## Kontroller
+Sistem `VisionPipeline` sınıfı üzerinden modüler bir yapıda çalışır:
 
-- **q**: Programdan çık
+1.  **Görüntü Alımı:** Kameradan kare okunur.
+2.  **YOLO Inference:** `ultralytics` kütüphanesi ile engeller (insan, araba, sandalye vb.) tespit edilir.
+3.  **Edge Detection:** `Canny` algoritması ile yol kenarları ve yapısal sınırlar belirlenir.
+4.  **IPM Dönüşümü:** Görüntü perspektifi kaldırılarak 2D kuş bakışı harita oluşturulur.
+5.  **Maske Oluşturma:**
+    - Kenarlar kalınlaştırılır.
+    - YOLO kutuları BEV düzlemine izdüşürülür.
+    - Güvenli alanlar (Free Space) beyaz, engeller siyah olarak maskelenir.
+6.  **Yol Planlama:** Maske üzerindeki en geniş ve engelsiz şerit (Sol, Orta, Sağ) seçilir.
+7.  **Geri Bildirim:** Karar verilen yön sesli olarak kullanıcıya iletilir.
 
-## Model Seçenekleri
+## 📂 Dosya Yapısı
 
-`main.py` içinde model değiştirilebilir:
+- `main.py`: Ana uygulama döngüsü, ses sistemi ve görselleştirme.
+- `vision_pipeline.py`: Görüntü işleme, IPM, maske oluşturma ve yön bulma mantığı.
+- `models/`: YOLO model dosyalarının bulunduğu klasör.
+- `audio_cache/`: Oluşturulan ses dosyalarının (MP3) önbelleği.
+- `AGENTIC.MD`: Proje geliştirme yol haritası ve teknik dokümantasyon.
 
-- `yolo11n.pt` - Nano (hızlı, hafif)
-- `yolo11s.pt` - Small
-- `yolo11m.pt` - Medium
-- `yolo11l.pt` - Large
-- `yolo11x.pt` - Extra Large
-- `yolov8n.pt` - YOLOv8 Nano
+## 🔧 Gereksinimler
 
-İlk çalıştırmada model otomatik indirilir.
-
-## Fonksiyonlar
-
-### `get_direction(obstacles, frame_width, frame_height)`
-
-Engel konumlarına göre güvenli yönü hesaplar.
-
-**Parametreler:**
-
-- `obstacles`: Bounding box listesi [(x1, y1, x2, y2), ...]
-- `frame_width`: Görüntü genişliği
-- `frame_height`: Görüntü yüksekliği
-
-**Dönüş:** "DÜZ", "SOL", "SAĞ" veya "DUR"
-
-### `draw_regions(frame, direction)`
-
-Görüntü üzerine bölgeleri ve yön bilgisini çizer.
-
-## Yön Belirleme Mantığı
-
-1. Görüntünün alt yarısı analiz edilir
-2. 3 bölgeye ayrılır: SOL, ORTA, SAĞ
-3. Her bölgedeki engel yoğunluğu hesaplanır
-4. En az engelli bölge güvenli yön olarak seçilir
-5. Öncelik: DÜZ > SOL > SAĞ
-6. Tüm bölgeler doluysa: DUR
+- Python 3.8+
+- OpenCV (`opencv-python`)
+- Ultralytics YOLO (`ultralytics`)
+- NumPy
+- gTTS (Google Text-to-Speech)
+- Pygame (Ses çalma için)

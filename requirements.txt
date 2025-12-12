@@ -5,3 +5,6 @@ gTTS
 pygame
 SpeechRecognition
 pyaudio
+torch
+torchvision
+timm

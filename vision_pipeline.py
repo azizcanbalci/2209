@@ -1,14 +1,12 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from collections import deque, Counter
 
 class VisionPipeline:
     def __init__(self, model_path="../models/yolo11n.pt"):
         """
         Görüntü işleme pipeline'ını başlatır.
-        
-        Args:
-            model_path: YOLO model dosyasının yolu
         """
         print(f"VisionPipeline başlatılıyor... Model: {model_path}")
         try:
@@ -18,10 +16,18 @@ class VisionPipeline:
             print(f"Model yükleme hatası: {e}")
             raise e
         
-        # IPM Matrisleri (Lazy initialization)
+        # IPM Matrisleri
         self.ipm_matrix = None
         self.ipm_width = 0
         self.ipm_height = 0
+        
+        # --- AKIL KATMANI (Memory) ---
+        # Son 7 karenin yön kararını saklar (Karar Stabilizasyonu için)
+        self.direction_memory = deque(maxlen=7)
+        
+        # Zemin rengi adaptasyonu için hareketli ortalama
+        self.floor_color_mean = None
+        self.floor_color_std = None
 
     def init_ipm(self, width, height):
         """
@@ -73,6 +79,72 @@ class VisionPipeline:
         # Canny Edge Detection
         edges = cv2.Canny(blurred, low_threshold, high_threshold)
         return edges
+
+    def detect_smart_floor(self, frame):
+        """
+        AKILLI ZEMİN TESPİTİ (Adaptive Color + Edge Consensus)
+        Sadece kenarlara bakmaz, zeminin rengini öğrenir ve ona göre karar verir.
+        """
+        h, w = frame.shape[:2]
+        
+        # 1. Ön İşleme
+        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        
+        # 2. Referans Bölgesi (Ayak Ucu - Güvenli Alan)
+        # Ekranın alt orta kısmı (100x100 piksel)
+        roi_h, roi_w = 100, 100
+        roi_y = h - roi_h
+        roi_x = (w - roi_w) // 2
+        sample_roi = hsv[roi_y:h, roi_x:roi_x+roi_w]
+        
+        # Anlık renk istatistikleri
+        current_mean = np.mean(sample_roi, axis=(0, 1))
+        current_std = np.std(sample_roi, axis=(0, 1))
+        
+        # Hafızalı Renk Öğrenme (Exponential Moving Average)
+        if self.floor_color_mean is None:
+            self.floor_color_mean = current_mean
+            self.floor_color_std = current_std
+        else:
+            # Yeni rengi %10 oranında hafızaya kat (Ani değişimleri engelle)
+            alpha = 0.1
+            self.floor_color_mean = (1 - alpha) * self.floor_color_mean + alpha * current_mean
+            self.floor_color_std = (1 - alpha) * self.floor_color_std + alpha * current_std
+            
+        # Dinamik Eşik Belirleme
+        # Standart sapmanın 4 katı kadar esneklik tanı
+        std_tolerance = np.maximum(self.floor_color_std, 10) # Min tolerans 10
+        lower_bound = np.clip(self.floor_color_mean - (std_tolerance * 4), 0, 255)
+        upper_bound = np.clip(self.floor_color_mean + (std_tolerance * 4), 0, 255)
+        
+        # 3. Renk Maskesi
+        color_mask = cv2.inRange(hsv, lower_bound.astype(np.uint8), upper_bound.astype(np.uint8))
+        
+        # 4. Kenar Tespiti (Canny)
+        gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 30, 100)
+        kernel = np.ones((5, 5), np.uint8)
+        dilated_edges = cv2.dilate(edges, kernel, iterations=2)
+        
+        # 5. Konsensüs: Renk Uygun VE Kenar Değil
+        floor_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(dilated_edges))
+        
+        # 6. Temizlik
+        floor_mask = cv2.morphologyEx(floor_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        floor_mask = cv2.morphologyEx(floor_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # 7. En Büyük Parçayı Seç (Ana Zemin)
+        contours, _ = cv2.findContours(floor_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            max_contour = max(contours, key=cv2.contourArea)
+            # Eğer çok küçükse (gürültü), boş döndür
+            if cv2.contourArea(max_contour) > (h * w * 0.05):
+                clean_mask = np.zeros_like(floor_mask)
+                cv2.drawContours(clean_mask, [max_contour], -1, 255, -1)
+                return clean_mask
+                
+        return floor_mask
 
     def create_free_space_mask(self, bev_edges):
         """
@@ -130,6 +202,7 @@ class VisionPipeline:
     def find_best_direction(self, free_space_mask):
         """
         Free space maskesine göre en güvenli yönü belirler.
+        AKILLI KARAR: Geçmiş kararları hatırlar ve titremeyi önler.
         """
         height, width = free_space_mask.shape
         
@@ -153,52 +226,60 @@ class VisionPipeline:
         # Doluluk oranları (Boş alan oranı)
         ratios = {k: v / total_area for k, v in scores.items()}
         
-        # Eğer tüm yollar tıkalıysa (< %10 boş alan)
-        if all(r < 0.1 for r in ratios.values()):
-            return "DUR"
-            
-        # En iyi skoru bul
-        best_direction = max(scores, key=scores.get)
+        current_decision = "DUR"
         
-        # "DÜZ" gitmek için hafif bir tolerans/öncelik tanıyalım
-        # Eğer DÜZ skoru, en iyinin %85'inden fazlaysa DÜZ gitmeyi tercih et
-        # Bu, sürekli küçük farklarla sağa/sola zikzak yapmayı engeller
-        if scores["DÜZ"] >= scores[best_direction] * 0.85:
-            return "DÜZ"
+        # Eğer tüm yollar tıkalıysa (< %15 boş alan)
+        if all(r < 0.15 for r in ratios.values()):
+            current_decision = "DUR"
+        else:
+            # En iyi skoru bul
+            best_direction = max(scores, key=scores.get)
             
-        return best_direction
+            # "DÜZ" gitmek için hafif bir tolerans/öncelik tanıyalım
+            if scores["DÜZ"] >= scores[best_direction] * 0.85:
+                current_decision = "DÜZ"
+            else:
+                current_decision = best_direction
+        
+        # --- AKIL KATMANI (Karar Stabilizasyonu) ---
+        self.direction_memory.append(current_decision)
+        
+        # Son 7 kararın en çok tekrar edeni (Mode)
+        # Bu sayede anlık bir "DUR" veya "SOL" hatası sistemi yanıltmaz
+        most_common_decision = Counter(self.direction_memory).most_common(1)[0][0]
+        
+        return most_common_decision
 
     def process_frame(self, frame):
         """
-        Bir kareyi işler: YOLO tespiti + Canny kenar tespiti + IPM + Free Space.
-        
-        Returns:
-            combined_view: İşlenmiş görüntü (görselleştirme için)
-            obstacles: Tespit edilen engellerin listesi
-            edges: Kenar haritası
-            bev_view: Kuş bakışı görünüm (IPM uygulanmış kenarlar)
-            free_space_mask: Serbest alan maskesi
+        Bir kareyi işler: YOLO tespiti + Akıllı Zemin Tespiti + IPM.
         """
-        # 1. YOLO Nesne Tespiti
-        results = self.model(frame, verbose=False, conf=0.4)
+        # 1. YOLO Nesne Tespiti (TRACKING MODU - Nesne Takibi)
+        # persist=True: Nesne ID'lerini korur (Hafıza)
+        results = self.model.track(frame, verbose=False, conf=0.4, persist=True)
         
-        # 2. Canny Kenar Tespiti
+        # 2. Akıllı Zemin Tespiti (Renk + Kenar)
+        # Eski yöntem yerine bunu kullanıyoruz
+        smart_floor_mask = self.detect_smart_floor(frame)
+        
+        # 3. Canny Kenar Tespiti (Görselleştirme ve yedek için)
         edges = self.detect_edges(frame)
         
-        # 3. IPM Dönüşümü (Kenar haritası üzerinde)
-        bev_edges = self.apply_ipm(edges)
-        bev_view = cv2.cvtColor(bev_edges, cv2.COLOR_GRAY2BGR)
+        # 4. IPM Dönüşümü (Zemin Maskesi üzerinde)
+        # Zemin maskesini kuş bakışına çevir
+        bev_mask = self.apply_ipm(smart_floor_mask)
+        bev_view = cv2.cvtColor(bev_mask, cv2.COLOR_GRAY2BGR)
         
-        # 4. Free Space Maskesi Oluşturma
-        free_space_mask = self.create_free_space_mask(bev_edges)
+        # Free Space Maskesi artık doğrudan BEV maskesi
+        free_space_mask = bev_mask
         
-        # Görselleştirme için kenar haritasını BGR'ye çevir
-        edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        
-        # Orijinal görüntü ile kenarları birleştir (Overlay)
-        # Kenar olan yerleri vurgula
+        # Görselleştirme
         combined_view = frame.copy()
-        combined_view[edges > 0] = [0, 255, 0]  # Kenarları yeşil yap
+        
+        # Zemini yeşil boya (Overlay)
+        floor_overlay = np.zeros_like(frame)
+        floor_overlay[smart_floor_mask == 255] = [0, 255, 0]
+        combined_view = cv2.addWeighted(combined_view, 1.0, floor_overlay, 0.3, 0)
         
         obstacles = []
         
@@ -213,9 +294,10 @@ class VisionPipeline:
                     conf = float(box.conf[0])
                     label = self.model.names[cls]
                     
-                    obstacles.append((x1, y1, x2, y2, label, conf))
+                    # ID varsa al (Tracking sayesinde)
+                    track_id = int(box.id[0]) if box.id is not None else -1
                     
-                    # Not: Çizim işlemleri ana döngüde yapılacak (mesafe bilgisi için)
+                    obstacles.append((x1, y1, x2, y2, label, conf))
 
         # 5. Hibrit Engel Haritası: YOLO engellerini maskeden çıkar
         free_space_mask = self.update_mask_with_obstacles(free_space_mask, obstacles)

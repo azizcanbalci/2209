@@ -72,40 +72,39 @@ def speech_worker():
             time.sleep(0.1)
 
 
-def estimate_distance(bbox_height: int, frame_height: int) -> tuple:
+def estimate_distance(y2: int, frame_height: int) -> tuple:
     """
-    Bounding box yüksekliğine göre yaklaşık mesafe tahmini yapar.
+    Nesnenin alt noktasına (y2) göre perspektif tabanlı mesafe tahmini yapar.
     
     Args:
-        bbox_height: Bounding box yüksekliği (piksel)
+        y2: Bounding box'ın alt y koordinatı (piksel)
         frame_height: Görüntü yüksekliği (piksel)
     
     Returns:
         tuple: (mesafe_metre, mesafe_kategori)
-        mesafe_kategori: "YAKIN" (<1.5m), "ORTA" (1.5-3m), "UZAK" (>3m)
+        mesafe_kategori: "YAKIN", "ORTA", "UZAK"
     """
-    # Bounding box'ın frame'e oranı
-    ratio = bbox_height / frame_height
+    # Nesnenin alt noktasının frame'e oranı (0.0 - 1.0)
+    # 1.0 = Ekranın en altı (Ayak ucu) -> Çok Yakın
+    # 0.5 = Ekranın ortası (Ufuk çizgisi) -> Uzak
+    ratio = y2 / frame_height
     
-    # Yaklaşık mesafe tahmini (kalibre edilebilir)
-    # Büyük bbox = yakın, küçük bbox = uzak
-    if ratio > 0.5:  # Çok büyük - çok yakın
+    # Perspektif tabanlı mesafe tahmini - REVIZE EDILDI (Daha dengeli)
+    # Eşikler biraz düşürüldü (Çok katı olmaması için)
+    if ratio > 0.85:  # Ayak ucunda (Ekranın alt %15'i) - 0.5m
         distance = 0.5
         category = "YAKIN"
-    elif ratio > 0.35:  # Büyük - yakın
+    elif ratio > 0.70:  # 1-2 metre (Ekranın alt %30'u)
         distance = 1.0
         category = "YAKIN"
-    elif ratio > 0.25:  # Orta büyüklük
-        distance = 1.5
+    elif ratio > 0.55:  # 3-4 metre (Ekranın alt yarısı)
+        distance = 2.0
         category = "ORTA"
-    elif ratio > 0.15:  # Küçük
-        distance = 2.5
-        category = "ORTA"
-    elif ratio > 0.08:  # Çok küçük
+    elif ratio > 0.40:  # 5-6 metre
         distance = 4.0
-        category = "UZAK"
-    else:  # Çok uzak
-        distance = 6.0
+        category = "ORTA"
+    else:  # Ufuk çizgisine yakın veya üstünde
+        distance = 8.0
         category = "UZAK"
     
     return distance, category
@@ -130,8 +129,8 @@ def get_closest_obstacle(obstacles: list, frame_height: int) -> tuple:
     closest_bbox = None
     
     for (x1, y1, x2, y2) in obstacles:
-        bbox_height = y2 - y1
-        distance, category = estimate_distance(bbox_height, frame_height)
+        # Yeni mesafe fonksiyonunu kullan (y2 ile)
+        distance, category = estimate_distance(y2, frame_height)
         
         if distance < min_distance:
             min_distance = distance
@@ -408,9 +407,8 @@ def main():
             # Tüm tespit edilen nesneler engel kabul edilecek
             obstacles.append((x1, y1, x2, y2))
             
-            # Mesafe tahmini
-            bbox_height = y2 - y1
-            distance, dist_category = estimate_distance(bbox_height, frame_height)
+            # Mesafe tahmini (Perspektif tabanlı - y2 kullanılarak)
+            distance, dist_category = estimate_distance(y2, frame_height)
             
             # Mesafeye göre renk belirle
             if dist_category == "YAKIN":

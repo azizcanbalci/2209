@@ -43,7 +43,8 @@ class NavigationService(BaseService):
         
         speech_cooldown = 0
         danger_cooldown = 0
-        last_direction = "DUR"
+        frame_count = 0
+        last_obstacles = []
         
         while self.running:
             ret, frame = self.cap.read()
@@ -51,20 +52,23 @@ class NavigationService(BaseService):
                 break
                 
             frame_height, frame_width = frame.shape[:2]
+            frame_count += 1
+            
+            # 5 karede 1 YOLO çalıştır
+            run_yolo = (frame_count % 5 == 0)
             
             # Pipeline işlemi
             try:
-                # Yeni Pipeline Çıktısı: combined_view, obstacles, fusion_map, bev_fusion, free_space_mask, depth_colormap
-                combined_view, obstacles, fusion_map, bev_fusion, free_space_mask, depth_colormap = self.pipeline.process_frame(frame)
+                # Yeni Pipeline Çıktısı: combined_view, obstacles, bev_edges, free_space_mask, direction
+                combined_view, obstacles, bev_edges, free_space_mask, direction = self.pipeline.process_frame(frame, run_yolo=run_yolo)
                 
-                # Yön bulma
-                direction = self.pipeline.find_best_direction(free_space_mask)
+                # Engelleri güncelle veya eskileri kullan
+                if run_yolo:
+                    last_obstacles = obstacles
+                else:
+                    obstacles = last_obstacles
                 
-                # En yakın engel kontrolü (Basit mantık)
-                # Not: VisionPipeline içinde mesafe hesabı yok, main.py'de vardı.
-                # Buraya basit bir mesafe kontrolü ekleyelim veya pipeline'a taşıyalım.
-                # Şimdilik pipeline çıktısındaki obstacles üzerinden gidelim.
-                
+                # En yakın engel kontrolü
                 min_dist = float('inf')
                 closest_cat = "UZAK"
                 
@@ -74,11 +78,23 @@ class NavigationService(BaseService):
                     h = y2 - y1
                     ratio = h / frame_height
                     
+                    # Merkez kontrolü: Engel gerçekten önümüzde mi?
+                    # Ekranın ortasındaki %60'lık dilime giriyor mu?
+                    obs_center_x = (x1 + x2) / 2
+                    screen_center = frame_width / 2
+                    safe_zone_width = frame_width * 0.6 # Ortadaki %60
+                    
+                    in_center_zone = (screen_center - safe_zone_width/2) < obs_center_x < (screen_center + safe_zone_width/2)
+                    
+                    if not in_center_zone:
+                        continue # Kenardaki engeller için "Çok Yakın" uyarısı verme
+                    
                     dist = 6.0
                     cat = "UZAK"
-                    if ratio > 0.5: cat = "YAKIN"; dist = 0.5
-                    elif ratio > 0.35: cat = "YAKIN"; dist = 1.0
-                    elif ratio > 0.25: cat = "ORTA"; dist = 1.5
+                    # Eşik değerleri yükseltildi (Daha az hassas)
+                    if ratio > 0.60: cat = "YAKIN"; dist = 0.5   # Çok büyük/yakın
+                    elif ratio > 0.45: cat = "YAKIN"; dist = 1.0 # Bayağı yakın
+                    elif ratio > 0.30: cat = "ORTA"; dist = 1.5  # Orta mesafe
                     
                     if dist < min_dist:
                         min_dist = dist
@@ -96,11 +112,10 @@ class NavigationService(BaseService):
                         self.audio_service.play(direction)
                         speech_cooldown = 90 # 3 saniye
                 
-                # Görselleştirme (Opsiyonel - Headless modda kapatılabilir)
-                cv2.imshow("Navigasyon (Fusion)", combined_view)
-                cv2.imshow("BEV (Fusion)", bev_fusion)
-                if depth_colormap is not None:
-                    cv2.imshow("Depth (MiDaS)", depth_colormap)
+                # Görselleştirme
+                cv2.imshow("Navigasyon (Canny+IPM)", combined_view)
+                cv2.imshow("BEV (Edges)", bev_edges)
+                cv2.imshow("Free Space", free_space_mask)
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.running = False

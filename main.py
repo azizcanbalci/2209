@@ -9,6 +9,58 @@ import os
 from gtts import gTTS
 import pygame
 
+# --- IP KAMERA İÇİN HIZLANDIRICI SINIF ---
+class LatestFrameReader:
+    """
+    IP Kameralardaki gecikmeyi (lag) önlemek için arka planda sürekli okuma yapar
+    ve her zaman en son kareyi verir.
+    """
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
+        # Buffer boyutunu küçültmeyi dene (Backend destekliyorsa)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        self.lock = threading.Lock()
+        self.running = True
+        self.latest_frame = None
+        self.ret = False
+        
+        # İlk kareyi oku
+        self.ret, self.latest_frame = self.cap.read()
+        if not self.ret:
+            print("Hata: Kamera başlatılamadı veya akış yok!")
+            self.running = False
+            return
+
+        # Okuma thread'ini başlat
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
+
+    def update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret = ret
+                self.latest_frame = frame
+            # CPU'yu boğmamak için minik bir uyku (opsiyonel, gerekirse kaldırılabilir)
+            time.sleep(0.001) 
+
+    def read(self):
+        with self.lock:
+            return self.ret, self.latest_frame
+
+    def release(self):
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join()
+        self.cap.release()
+    
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def set(self, prop, value):
+        self.cap.set(prop, value)
+
 # Pygame mixer başlat
 pygame.mixer.init()
 
@@ -75,36 +127,29 @@ def speech_worker():
 def estimate_distance(y2: int, frame_height: int) -> tuple:
     """
     Nesnenin alt noktasına (y2) göre perspektif tabanlı mesafe tahmini yapar.
-    
-    Args:
-        y2: Bounding box'ın alt y koordinatı (piksel)
-        frame_height: Görüntü yüksekliği (piksel)
-    
-    Returns:
-        tuple: (mesafe_metre, mesafe_kategori)
-        mesafe_kategori: "YAKIN", "ORTA", "UZAK"
+    KALİBRASYON: Ortalama bir insan boyu ve kamera açısı varsayılarak optimize edildi.
     """
     # Nesnenin alt noktasının frame'e oranı (0.0 - 1.0)
-    # 1.0 = Ekranın en altı (Ayak ucu) -> Çok Yakın
-    # 0.5 = Ekranın ortası (Ufuk çizgisi) -> Uzak
+    # 1.0 = Ekranın en altı (Ayak ucu) -> 0 metre
+    # 0.5 = Ekranın ortası -> Sonsuz (Ufuk)
     ratio = y2 / frame_height
     
-    # Perspektif tabanlı mesafe tahmini - REVIZE EDILDI (Daha dengeli)
-    # Eşikler biraz düşürüldü (Çok katı olmaması için)
-    if ratio > 0.85:  # Ayak ucunda (Ekranın alt %15'i) - 0.5m
-        distance = 0.5
+    # Mesafe Tahmini (Empirik Formül)
+    # Basit Eşikler (Optimize Edilmiş)
+    if ratio > 0.90:      # < 0.5 metre (Çok Tehlikeli)
+        distance = 0.3
         category = "YAKIN"
-    elif ratio > 0.70:  # 1-2 metre (Ekranın alt %30'u)
+    elif ratio > 0.75:    # 0.5 - 1.5 metre (Tehlikeli)
         distance = 1.0
         category = "YAKIN"
-    elif ratio > 0.55:  # 3-4 metre (Ekranın alt yarısı)
-        distance = 2.0
+    elif ratio > 0.60:    # 1.5 - 3.0 metre (Dikkat)
+        distance = 2.5
         category = "ORTA"
-    elif ratio > 0.40:  # 5-6 metre
-        distance = 4.0
+    elif ratio > 0.45:    # 3.0 - 6.0 metre (Güvenli)
+        distance = 5.0
         category = "ORTA"
-    else:  # Ufuk çizgisine yakın veya üstünde
-        distance = 8.0
+    else:                 # > 6.0 metre (Uzak)
+        distance = 10.0
         category = "UZAK"
     
     return distance, category
@@ -359,14 +404,22 @@ def main():
     
     # Kamerayı aç
     print("Kamera aciliyor...")
-    cap = cv2.VideoCapture(0)
+    # IP Webcam URL
+    ip_camera_url = "http://172.18.161.201:8080/video"
+    
+    # Standart VideoCapture yerine LatestFrameReader kullanıyoruz
+    # Bu sınıf arka planda sürekli okuma yaparak gecikmeyi önler
+    cap = LatestFrameReader(ip_camera_url)
     
     if not cap.isOpened():
-        print("HATA: Kamera acilamadi!")
-        print("Lutfen kameranizin bagli oldugunu kontrol edin.")
-        return
+        print(f"HATA: IP Kamera ({ip_camera_url}) acilamadi!")
+        print("Varsayilan kamera (0) deneniyor...")
+        cap = LatestFrameReader(0)
+        if not cap.isOpened():
+            print("HATA: Hicbir kamera acilamadi!")
+            return
     
-    # Kamera ayarları
+    # Kamera ayarları (IP kamerada çalışmayabilir ama yine de kalsın)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
@@ -380,9 +433,16 @@ def main():
     
     while True:
         ret, frame = cap.read()
-        if not ret:
-            print("Kare alinamadi!")
-            break
+        if not ret or frame is None:
+            print("Kare alinamadi! (Yeniden baglaniliyor...)")
+            time.sleep(0.1)
+            continue
+        
+        # --- PERFORMANS VE BOYUT DÜZELTME ---
+        # Görüntüyü her zaman 640x480 boyutuna zorla.
+        # Bu hem işlemeyi hızlandırır hem de bölge hesaplamalarının (Sol/Orta/Sağ)
+        # her kamerada doğru çalışmasını sağlar.
+        frame = cv2.resize(frame, (640, 480))
         
         frame_count += 1
         frame_height, frame_width = frame.shape[:2]

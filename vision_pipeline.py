@@ -178,24 +178,40 @@ class VisionPipeline:
     def update_mask_with_obstacles(self, mask, obstacles):
         """
         YOLO engellerini maskeden çıkarır (Siyah yapar).
+        Engellerin boyutunu dikkate alır ve kenarlardan biraz kırpar (Shrink).
         """
         for item in obstacles:
             # item: (x1, y1, x2, y2, label, conf)
             x1, y1, x2, y2 = item[:4]
             
-            # Engelin yere bastığı noktayı bul (Alt orta nokta)
-            bottom_center_x = (x1 + x2) / 2
-            bottom_center_y = y2
+            # Kutuyu biraz daralt (Yatayda %30 kırp - %15 sağdan, %15 soldan)
+            # Bu sayede nesnenin yanındaki boşluklar engel sayılmaz.
+            w = x2 - x1
+            shrink_factor = 0.3 # %30 daraltma (Daha agresif)
+            x1_shrunk = x1 + (w * shrink_factor / 2)
+            x2_shrunk = x2 - (w * shrink_factor / 2)
             
+            # Engelin yere bastığı noktalar (Sol alt ve Sağ alt)
             # IPM ile BEV koordinatlarına çevir
-            bev_point = self.project_point((bottom_center_x, bottom_center_y))
-            bx, by = int(bev_point[0]), int(bev_point[1])
+            p1 = self.project_point((x1_shrunk, y2))
+            p2 = self.project_point((x2_shrunk, y2))
+            
+            bx1, by1 = int(p1[0]), int(p1[1])
+            bx2, by2 = int(p2[0]), int(p2[1])
+            
+            # Engel genişliği (BEV düzleminde)
+            obstacle_width_bev = abs(bx2 - bx1)
+            center_x = (bx1 + bx2) // 2
+            center_y = (by1 + by2) // 2 
+            
+            # Yarıçap belirle (Genişliğin yarısı)
+            # Minimum bir boyut da verelim (örneğin 15px)
+            radius = max(15, obstacle_width_bev // 2)
             
             # Maske sınırları içinde mi?
-            if 0 <= bx < mask.shape[1] and 0 <= by < mask.shape[0]:
+            if 0 <= center_x < mask.shape[1] and 0 <= center_y < mask.shape[0]:
                 # Maske üzerinde engeli işaretle (Siyah daire)
-                # Engelin boyutuna göre yarıçap belirleyebiliriz ama şimdilik sabit güvenli alan
-                cv2.circle(mask, (bx, by), 40, 0, -1) # 0 = Siyah (Engel)
+                cv2.circle(mask, (center_x, center_y), int(radius), 0, -1) 
             
         return mask
 
@@ -203,40 +219,51 @@ class VisionPipeline:
         """
         Free space maskesine göre en güvenli yönü belirler.
         AKILLI KARAR: Geçmiş kararları hatırlar ve titremeyi önler.
+        AĞIRLIKLI PUANLAMA: Yakındaki boşluklar uzaktakilerden daha değerlidir.
         """
         height, width = free_space_mask.shape
+        
+        # Ağırlık Matrisi (Gradient) oluştur
+        # Aşağısı (Yakın) = 1.0, Yukarısı (Uzak) = 0.1
+        # Bu sayede yakındaki engeller/boşluklar kararı domine eder.
+        weights = np.linspace(0.1, 1.0, height).reshape(-1, 1)
+        
+        # Maskeyi normalize et (0-1) ve ağırlıkla çarp
+        # free_space_mask: 0 (Engel) veya 255 (Boş)
+        weighted_mask = (free_space_mask / 255.0) * weights
         
         # 3 şerit (Sol, Orta, Sağ)
         w_third = width // 3
         
-        left_strip = free_space_mask[:, :w_third]
-        center_strip = free_space_mask[:, w_third:2*w_third]
-        right_strip = free_space_mask[:, 2*w_third:]
+        left_strip = weighted_mask[:, :w_third]
+        center_strip = weighted_mask[:, w_third:2*w_third]
+        right_strip = weighted_mask[:, 2*w_third:]
         
-        # Her şeritteki beyaz piksel sayısı (Boş alan miktarı)
+        # Skorlar (Ağırlıklı Toplam)
         scores = {
-            "SOL": np.sum(left_strip == 255),
-            "DÜZ": np.sum(center_strip == 255),
-            "SAG": np.sum(right_strip == 255)
+            "SOL": np.sum(left_strip),
+            "DÜZ": np.sum(center_strip),
+            "SAG": np.sum(right_strip)
         }
         
-        # Toplam alan (her şerit için yaklaşık)
-        total_area = height * w_third
+        # Maksimum olası skor (Her şerit için)
+        max_possible_score = np.sum(weights) * w_third
         
-        # Doluluk oranları (Boş alan oranı)
-        ratios = {k: v / total_area for k, v in scores.items()}
+        # Doluluk oranları (0.0 - 1.0)
+        ratios = {k: v / max_possible_score for k, v in scores.items()}
         
         current_decision = "DUR"
         
-        # Eğer tüm yollar tıkalıysa (< %15 boş alan)
-        if all(r < 0.15 for r in ratios.values()):
+        # Eşik Değeri: %20'den az güvenli alan varsa DUR
+        if all(r < 0.20 for r in ratios.values()):
             current_decision = "DUR"
         else:
             # En iyi skoru bul
             best_direction = max(scores, key=scores.get)
             
-            # "DÜZ" gitmek için hafif bir tolerans/öncelik tanıyalım
-            if scores["DÜZ"] >= scores[best_direction] * 0.85:
+            # "DÜZ" gitmek için tolerans (Histeresis)
+            # Eğer DÜZ skoru, en iyinin %80'i kadarsa bile DÜZ git.
+            if scores["DÜZ"] >= scores[best_direction] * 0.80:
                 current_decision = "DÜZ"
             else:
                 current_decision = best_direction
@@ -244,8 +271,7 @@ class VisionPipeline:
         # --- AKIL KATMANI (Karar Stabilizasyonu) ---
         self.direction_memory.append(current_decision)
         
-        # Son 7 kararın en çok tekrar edeni (Mode)
-        # Bu sayede anlık bir "DUR" veya "SOL" hatası sistemi yanıltmaz
+        # Son 5 kararın en çok tekrar edeni (Daha hızlı tepki için 7'den 5'e düşürdüm)
         most_common_decision = Counter(self.direction_memory).most_common(1)[0][0]
         
         return most_common_decision

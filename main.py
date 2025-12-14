@@ -8,6 +8,10 @@ import time
 import os
 from gtts import gTTS
 import pygame
+from services.voice_chat import VoiceChatAgent
+
+# --- AYARLAR ---
+GEMINI_API_KEY = "BURAYA_API_KEY_GELECEK" # Kullanıcıdan alınacak
 
 # --- IP KAMERA İÇİN HIZLANDIRICI SINIF ---
 class LatestFrameReader:
@@ -370,194 +374,183 @@ def draw_regions(frame: np.ndarray, direction: str) -> np.ndarray:
 
 def main():
     """
-    Ana fonksiyon - Kamerayı açar, YOLO ile engel tespiti yapar ve yön belirler.
+    Ana fonksiyon - İki modlu sistem:
+    1. Yol Modu (VisionPipeline)
+    2. Sohbet Modu (VoiceChatAgent)
     """
     global speech_thread_running
     
-    print("YOLOv11 Engel Tespit Sistemi Baslatiliyor...")
-    print("Cikmak icin 'q' tusuna basin.")
+    print("Akıllı Asistan Sistemi Başlatılıyor...")
+    print("Çıkmak için 'q' tuşuna basın.")
     print("-" * 50)
     
     # Ses dosyalarını oluştur
-    print("Ses dosyalari hazirlaniyor...")
     create_audio_files()
     
-    # Ses thread'ini başlat
-    print("Ses sistemi baslatiliyor...")
+    # Ses thread'ini başlat (Yol modu için)
     speech_thread_running = True
     speech_thread = threading.Thread(target=speech_worker, daemon=True)
     speech_thread.start()
     
-    # Test sesi
-    speech_queue.put("HAZIR")
-    time.sleep(2)  # Test sesinin bitmesini bekle
-    print("Ses sistemi hazir!")
-    
+    # Sesli Sohbet Ajanı (Başlangıçta pasif)
+    voice_agent = None
+    if GEMINI_API_KEY != "BURAYA_API_KEY_GELECEK":
+        voice_agent = VoiceChatAgent(GEMINI_API_KEY)
+    else:
+        print("UYARI: Gemini API Key girilmedi! Sohbet modu çalışmayacak.")
+
     # YOLOv11 modelini yükle (VisionPipeline üzerinden)
-    print("Vision Pipeline baslatiliyor...")
+    print("Vision Pipeline başlatılıyor...")
     try:
         pipeline = VisionPipeline("../models/yolo11n.pt")
-        print("Pipeline hazir!")
+        print("Pipeline hazır!")
     except Exception as e:
-        print(f"Pipeline baslatma hatasi: {e}")
+        print(f"Pipeline başlatma hatası: {e}")
         return
     
     # Kamerayı aç
-    print("Kamera aciliyor...")
-    # IP Webcam URL
+    print("Kamera açılıyor...")
     ip_camera_url = "http://172.18.161.201:8080/video"
-    
-    # Standart VideoCapture yerine LatestFrameReader kullanıyoruz
-    # Bu sınıf arka planda sürekli okuma yaparak gecikmeyi önler
     cap = LatestFrameReader(ip_camera_url)
     
     if not cap.isOpened():
-        print(f"HATA: IP Kamera ({ip_camera_url}) acilamadi!")
-        print("Varsayilan kamera (0) deneniyor...")
+        print(f"HATA: IP Kamera ({ip_camera_url}) açılamadı!")
+        print("Varsayılan kamera (0) deneniyor...")
         cap = LatestFrameReader(0)
         if not cap.isOpened():
-            print("HATA: Hicbir kamera acilamadi!")
+            print("HATA: Hiçbir kamera açılamadı!")
             return
     
-    # Kamera ayarları (IP kamerada çalışmayabilir ama yine de kalsın)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    print("Sistem hazır!")
     
-    print("Sistem hazir! Engel tespiti basliyor...")
-    print("-" * 50)
-    
-    frame_count = 0
-    last_spoken_direction = None  # Son söylenen yön
-    speech_cooldown = 0  # Hemen başla
-    danger_cooldown = 0  # Yakın engel uyarısı için cooldown
+    # --- MOD SEÇİMİ (BAŞLANGIÇ) ---
+    print("\n" + "="*30)
+    print("LÜTFEN BİR MOD SEÇİNİZ:")
+    print("[1] Yol Modu (Kamera + Engel Tespiti)")
+    print("[2] Sohbet Modu (Yapay Zeka Asistanı)")
+    print("="*30)
     
     while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            print("Kare alinamadi! (Yeniden baglaniliyor...)")
-            time.sleep(0.1)
-            continue
-        
-        # --- PERFORMANS VE BOYUT DÜZELTME ---
-        # Görüntüyü her zaman 640x480 boyutuna zorla.
-        # Bu hem işlemeyi hızlandırır hem de bölge hesaplamalarının (Sol/Orta/Sağ)
-        # her kamerada doğru çalışmasını sağlar.
-        frame = cv2.resize(frame, (640, 480))
-        
-        frame_count += 1
-        frame_height, frame_width = frame.shape[:2]
-        
-        # Vision Pipeline ile işle (YOLO + Canny + IPM + Free Space)
-        combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
-        
-        # Free Space Maskesini BEV görüntüsüne yeşil overlay olarak ekle
-        # Maskenin beyaz olduğu yerleri (boş alanları) yeşil yap
-        free_space_overlay = np.zeros_like(bev_view)
-        free_space_overlay[free_space_mask > 0] = [0, 255, 0]
-        
-        # BEV görüntüsü ile karıştır
-        bev_combined = cv2.addWeighted(bev_view, 0.7, free_space_overlay, 0.3, 0)
-        
-        # Tespit edilen engelleri topla
-        obstacles = []
-        
-        for item in pipeline_obstacles:
-            x1, y1, x2, y2, class_name, confidence = item
-            
-            # Tüm tespit edilen nesneler engel kabul edilecek
-            obstacles.append((x1, y1, x2, y2))
-            
-            # Mesafe tahmini (Perspektif tabanlı - y2 kullanılarak)
-            distance, dist_category = estimate_distance(y2, frame_height)
-            
-            # Mesafeye göre renk belirle
-            if dist_category == "YAKIN":
-                box_color = (0, 0, 255)  # Kırmızı - tehlikeli
-            elif dist_category == "ORTA":
-                box_color = (0, 165, 255)  # Turuncu - dikkat
-            else:
-                box_color = (0, 255, 0)  # Yeşil - güvenli
-            
-            # Bounding box çiz (Combined view üzerine)
-            cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
-            
-            # Etiket (mesafe ile birlikte)
-            label = f"{class_name}: {distance:.1f}m"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(combined_view, (x1, y1 - label_size[1] - 10), 
-                          (x1 + label_size[0], y1), box_color, -1)
-            cv2.putText(combined_view, label, (x1, y1 - 5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        
-        # En yakın engeli bul
-        min_distance, closest_category, closest_bbox = get_closest_obstacle(obstacles, frame_height)
-        
-        # Yön hesapla (Yeni Algoritma: Free Space Maskesi üzerinden)
-        direction = pipeline.find_best_direction(free_space_mask)
-        # Eski yöntem: direction = get_direction(obstacles, frame_width, frame_height)
-        
-        # Cooldown azalt
-        if speech_cooldown > 0:
-            speech_cooldown -= 1
-        if danger_cooldown > 0:
-            danger_cooldown -= 1
-        
-        # Yakın engel uyarısı (ayrı cooldown ile)
-        if closest_category == "YAKIN" and danger_cooldown <= 0:
-            print("UYARI: Çok yakın engel!")
-            speech_queue.put("YAKIN")
-            danger_cooldown = 60  # 2 saniye cooldown
-        
-        # Sürekli yön söyleme (her 3 saniyede bir)
-        if speech_cooldown <= 0:
-            print(f"Ses komutu kuyruğa eklendi: {direction}")
-            
-            # Kuyruğu temizle ve yeni komutu ekle
-            while not speech_queue.empty():
-                try:
-                    speech_queue.get_nowait()
-                except:
-                    pass
-            speech_queue.put(direction)
-            
-            last_spoken_direction = direction
-            speech_cooldown = 90  # 90 kare (yaklaşık 3 saniye) cooldown
-        
-        # Bölgeleri ve yönü çiz
-        combined_view = draw_regions(combined_view, direction)
-        
-        # Mesafe bilgisi göster
-        if min_distance is not None:
-            distance_color = (0, 0, 255) if closest_category == "YAKIN" else (0, 255, 255) if closest_category == "ORTA" else (0, 255, 0)
-            cv2.putText(combined_view, f"En Yakin: {min_distance:.1f}m", (10, frame_height - 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, distance_color, 2)
-        else:
-            cv2.putText(combined_view, "En Yakin: Yok", (10, frame_height - 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Engel sayısını göster
-        cv2.putText(combined_view, f"Engel Sayisi: {len(obstacles)}", (10, frame_height - 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        # FPS göster (her 30 karede bir)
-        if frame_count % 30 == 0:
-            dist_str = f"{min_distance:.1f}m" if min_distance else "Yok"
-            print(f"Kare: {frame_count} | Engel: {len(obstacles)} | Yon: {direction} | Mesafe: {dist_str}")
-        
-        # Görüntüyü göster
-        cv2.imshow("YOLOv11 Engel Tespit - Yon Belirleme", combined_view)
-        cv2.imshow("Kus Bakisi (BEV) - Free Space", bev_combined)
-        
-        # Çıkış için 'q' tuşu
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("\nProgram sonlandiriliyor...")
+        user_choice = input("Seçiminiz (1 veya 2): ").strip()
+        if user_choice == '1':
+            current_mode = 1
+            print(">> YOL MODU SEÇİLDİ.")
             break
+        elif user_choice == '2':
+            current_mode = 2
+            print(">> SOHBET MODU SEÇİLDİ.")
+            break
+        else:
+            print("Hatalı seçim! Lütfen 1 veya 2 yazıp Enter'a basın.")
+
+    speech_queue.put("HAZIR") # "Sistem hazır" sesi
+    if current_mode == 2 and voice_agent:
+        voice_agent.start_session()
+    
+    frame_count = 0
+    speech_cooldown = 0
+    danger_cooldown = 0
+    
+    while True:
+        # Klavye kontrolü (Çalışma anında değişim için)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('1'):
+            if current_mode != 1:
+                current_mode = 1
+                print("MOD DEĞİŞTİ: Yol Modu")
+                if voice_agent: voice_agent.stop_session()
+                speech_queue.put("Yol modu aktif")
+        elif key == ord('2'):
+            if current_mode != 2:
+                current_mode = 2
+                print("MOD DEĞİŞTİ: Sohbet Modu")
+                if voice_agent: voice_agent.start_session()
+                else: speech_queue.put("Sohbet modu kullanılamıyor")
+        
+        # --- MOD 1: YOL MODU ---
+        if current_mode == 1:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                time.sleep(0.1)
+                continue
+            
+            frame = cv2.resize(frame, (640, 480))
+            frame_count += 1
+            frame_height, frame_width = frame.shape[:2]
+            
+            # Vision Pipeline İşlemleri
+            combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
+            
+            # Free Space Overlay
+            free_space_overlay = np.zeros_like(bev_view)
+            free_space_overlay[free_space_mask > 0] = [0, 255, 0]
+            bev_combined = cv2.addWeighted(bev_view, 0.7, free_space_overlay, 0.3, 0)
+            
+            # Engelleri Topla ve Çiz
+            obstacles = []
+            for item in pipeline_obstacles:
+                x1, y1, x2, y2, class_name, confidence = item
+                obstacles.append((x1, y1, x2, y2))
+                
+                # Mesafe ve Çizim
+                distance, dist_category = estimate_distance(y2, frame_height)
+                box_color = (0, 0, 255) if dist_category == "YAKIN" else (0, 165, 255) if dist_category == "ORTA" else (0, 255, 0)
+                cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
+                cv2.putText(combined_view, f"{class_name} {distance:.1f}m", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+            # En yakın engel ve Yön
+            min_distance, closest_category, closest_bbox = get_closest_obstacle(obstacles, frame_height)
+            direction = pipeline.find_best_direction(free_space_mask)
+            
+            # Sesli Uyarılar (Yol Modu)
+            if speech_cooldown > 0: speech_cooldown -= 1
+            if danger_cooldown > 0: danger_cooldown -= 1
+            
+            if closest_category == "YAKIN" and danger_cooldown <= 0:
+                speech_queue.put("YAKIN")
+                danger_cooldown = 60
+            
+            if speech_cooldown <= 0:
+                # Kuyruğu temizle (gecikmeyi önle)
+                while not speech_queue.empty():
+                    try: speech_queue.get_nowait()
+                    except: pass
+                speech_queue.put(direction)
+                speech_cooldown = 90
+            
+            # Görselleştirme
+            combined_view = draw_regions(combined_view, direction)
+            cv2.imshow("Akilli Asistan", combined_view)
+            # cv2.imshow("Kus Bakisi", bev_combined)
+
+        # --- MOD 2: SOHBET MODU ---
+        elif current_mode == 2:
+            # Sohbet modunda kamerayı göstermeye devam et ama işlem yapma
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frame = cv2.resize(frame, (640, 480))
+                # Bilgi ekranı
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (640, 480), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+                
+                cv2.putText(frame, "SOHBET MODU AKTIF", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(frame, "Konusmak icin bekleyin...", (180, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.putText(frame, "[1] Yol Moduna Don", (200, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                
+                cv2.imshow("Akilli Asistan", frame)
+            
+            # Sesli Sohbet İşlemi (Tek adım)
+            if voice_agent:
+                voice_agent.process_step()
     
     # Temizlik
     speech_thread_running = False
     cap.release()
     cv2.destroyAllWindows()
-    print("Program basariyla sonlandirildi.")
+    print("Program sonlandırıldı.")
 
 
 if __name__ == "__main__":

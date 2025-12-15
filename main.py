@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 # from ultralytics import YOLO  # Artık VisionPipeline içinde
 from vision_pipeline import VisionPipeline
+from navigation_map import NavigationMap, DepthEstimator
+from radar_navigation import RadarNavigation
 import threading
 from queue import Queue
 import time
@@ -68,29 +70,51 @@ pygame.mixer.init()
 speech_queue = Queue()
 speech_thread_running = True
 
+# YÖN STABİLİZASYONU - Kör kullanıcı için kritik
+from collections import deque
+direction_history = deque(maxlen=10)  # Son 10 yön kararı
+stable_direction = "DÜZ"  # Stabil yön (söylenecek)
+stability_counter = 0  # Aynı yön kaç kez tekrarlandı
+MIN_STABILITY_COUNT = 5  # Yön değişmeden önce minimum tekrar sayısı
+
 # Ses dosyaları için klasör
 AUDIO_DIR = "audio_cache"
 if not os.path.exists(AUDIO_DIR):
     os.makedirs(AUDIO_DIR)
 
 def create_audio_files():
-    """Başlangıçta ses dosyalarını oluştur"""
+    """Başlangıçta ses dosyalarını oluştur - Engelli bireyler için optimize edilmiş"""
     commands = {
-        "SOL": "sola dön",
-        "DÜZ": "düz git",
-        "SAG": "sağa dön", 
-        "DUR": "dur",
-        "HAZIR": "Sistem hazır",
-        "YAKIN": "Dikkat! Çok yakın engel",
-        "UZAK": "Yol açık"
+        # Yön komutları - Net ve anlaşılır
+        "SOL": "Sola dönün",
+        "DÜZ": "Düz devam edin, yol açık",
+        "SAG": "Sağa dönün",
+        "HAFIF_SOL": "Hafifçe sola yönelin",
+        "HAFIF_SAG": "Hafifçe sağa yönelin",
+        
+        # Uyarı komutları
+        "DUR": "Durun! Önünüzde engel var",
+        "YAKIN": "Dikkat! Yakınınızda engel var, yavaşlayın",
+        "COK_YAKIN": "Durun! Çok yakın engel",
+        
+        # Bilgi komutları
+        "HAZIR": "Sistem hazır. Yürümeye başlayabilirsiniz",
+        "ACIK": "Yol açık, güvenle ilerleyebilirsiniz",
+        "ENGEL_YOK": "Önünüzde engel yok"
     }
     
+    # Yeni komutları oluştur (mevcut olmayanları)
     for key, text in commands.items():
         filepath = os.path.join(AUDIO_DIR, f"{key}.mp3")
-        if not os.path.exists(filepath):
+        # Yeni komutlar için veya dosya yoksa oluştur
+        needs_create = not os.path.exists(filepath) or key in ["COK_YAKIN", "ACIK", "HAFIF_SOL", "HAFIF_SAG"]
+        if needs_create:
             print(f"Ses dosyası oluşturuluyor: {text}")
-            tts = gTTS(text=text, lang='tr')
-            tts.save(filepath)
+            try:
+                tts = gTTS(text=text, lang='tr')
+                tts.save(filepath)
+            except Exception as e:
+                print(f"Ses oluşturma hatası ({key}): {e}")
     print("Ses dosyaları hazır!")
 
 def play_sound(command):
@@ -124,35 +148,69 @@ def speech_worker():
             time.sleep(0.1)
 
 
-def estimate_distance(y2: int, frame_height: int) -> tuple:
-    """
-    Nesnenin alt noktasına (y2) göre perspektif tabanlı mesafe tahmini yapar.
-    KALİBRASYON: Ortalama bir insan boyu ve kamera açısı varsayılarak optimize edildi.
-    """
-    # Nesnenin alt noktasının frame'e oranı (0.0 - 1.0)
-    # 1.0 = Ekranın en altı (Ayak ucu) -> 0 metre
-    # 0.5 = Ekranın ortası -> Sonsuz (Ufuk)
-    ratio = y2 / frame_height
+# ============ KALİBRASYON AYARLARI (KÖR KULLANICI İÇİN) ============
+CALIBRATION = {
+    # BOYUT EŞİKLERİ - Küçük nesneler UZAK kabul edilir
+    "tiny_size": 0.08,      # %8'den küçük = kesinlikle uzak (görmezden gel)
+    "small_size": 0.15,     # %15'ten küçük = uzak
+    "medium_size": 0.25,    # %25'ten küçük = orta
+    "large_size": 0.40,     # %40'tan büyük = yakın
     
-    # Mesafe Tahmini (Empirik Formül)
-    # Basit Eşikler (Optimize Edilmiş)
-    if ratio > 0.90:      # < 0.5 metre (Çok Tehlikeli)
-        distance = 0.3
-        category = "YAKIN"
-    elif ratio > 0.75:    # 0.5 - 1.5 metre (Tehlikeli)
-        distance = 1.0
-        category = "YAKIN"
-    elif ratio > 0.60:    # 1.5 - 3.0 metre (Dikkat)
-        distance = 2.5
-        category = "ORTA"
-    elif ratio > 0.45:    # 3.0 - 6.0 metre (Güvenli)
-        distance = 5.0
-        category = "ORTA"
-    else:                 # > 6.0 metre (Uzak)
-        distance = 10.0
-        category = "UZAK"
+    # YAKIN uyarısı için nesne hem BÜYÜK hem de ALTTA olmalı
+    "min_size_for_warning": 0.25,  # YAKIN uyarısı için min %25 boyut
+    "min_y_ratio_for_close": 0.75, # Ekranın alt %25'inde olmalı
+}
+
+def estimate_distance(y2: int, frame_height: int, bbox_height: int = None) -> tuple:
+    """
+    KÖR KULLANICI İÇİN KALİBRE EDİLMİŞ mesafe tahmini.
+    KURAL: Küçük nesne = UZAK. Sadece BÜYÜK + ALTTA = YAKIN.
+    """
+    y_ratio = y2 / frame_height  # Nesnenin dikey konumu (0=üst, 1=alt)
     
-    return distance, category
+    # Boyut oranı hesapla
+    if bbox_height is not None and bbox_height > 0:
+        size_ratio = bbox_height / frame_height
+    else:
+        size_ratio = 0.10  # Bilinmiyorsa küçük say
+    
+    # ========== BOYUT BAZLI SINIFLANDIRMA ==========
+    # KURAL 1: Çok küçük nesne = KESİNLİKLE UZAK (ne olursa olsun)
+    if size_ratio < CALIBRATION["tiny_size"]:  # <%8
+        return 8.0, "UZAK"
+    
+    # KURAL 2: Küçük nesne = UZAK
+    if size_ratio < CALIBRATION["small_size"]:  # <%15
+        return 6.0, "UZAK"
+    
+    # KURAL 3: Orta-küçük nesne = En fazla ORTA olabilir
+    if size_ratio < CALIBRATION["medium_size"]:  # <%25
+        if y_ratio > 0.85:  # Çok altta
+            return 3.0, "ORTA"
+        else:
+            return 5.0, "UZAK"
+    
+    # ========== BÜYÜK NESNELER İÇİN KONUM KONTROLÜ ==========
+    # KURAL 4: Büyük nesne + altta = YAKIN
+    if size_ratio >= CALIBRATION["large_size"]:  # >%40
+        if y_ratio > 0.90:  # Ekranın en altında
+            return 0.5, "COK_YAKIN"
+        elif y_ratio > 0.80:
+            return 1.0, "YAKIN"
+        elif y_ratio > 0.65:
+            return 2.0, "ORTA"
+        else:
+            return 3.5, "ORTA"
+    
+    # KURAL 5: Orta boy nesne (%25-%40)
+    if y_ratio > 0.88:  # Çok altta
+        return 1.5, "YAKIN"
+    elif y_ratio > 0.75:
+        return 2.5, "ORTA"
+    elif y_ratio > 0.60:
+        return 4.0, "ORTA"
+    else:
+        return 5.0, "UZAK"
 
 
 def get_closest_obstacle(obstacles: list, frame_height: int) -> tuple:
@@ -174,8 +232,9 @@ def get_closest_obstacle(obstacles: list, frame_height: int) -> tuple:
     closest_bbox = None
     
     for (x1, y1, x2, y2) in obstacles:
-        # Yeni mesafe fonksiyonunu kullan (y2 ile)
-        distance, category = estimate_distance(y2, frame_height)
+        # Nesne boyutunu da hesaba kat
+        bbox_height = y2 - y1
+        distance, category = estimate_distance(y2, frame_height, bbox_height)
         
         if distance < min_distance:
             min_distance = distance
@@ -216,6 +275,52 @@ def speak_direction(direction: str, engine):
     except Exception as e:
         print(f"Ses hatasi: {e}")
 
+
+def stabilize_direction(new_direction: str) -> str:
+    """
+    KÖR KULLANICI İÇİN YÖN STABİLİZASYONU.
+    Yön değişikliği için aynı yönün birkaç kez tekrarlanması gerekir.
+    Bu, hızlı değişimleri önler ve tutarlı komutlar sağlar.
+    
+    Args:
+        new_direction: Pipeline'dan gelen yeni yön
+    
+    Returns:
+        str: Stabil yön (söylenecek)
+    """
+    global direction_history, stable_direction, stability_counter
+    
+    # Yeni yönü history'ye ekle
+    direction_history.append(new_direction)
+    
+    # Son N yönün çoğunluğunu bul (ağırlıklı - son yönler daha önemli)
+    if len(direction_history) >= 3:
+        # Son 5 yönü say
+        recent_directions = list(direction_history)[-5:]
+        direction_counts = {}
+        for i, d in enumerate(recent_directions):
+            # Son yönlere daha fazla ağırlık ver
+            weight = 1 + (i * 0.5)  # 1, 1.5, 2, 2.5, 3
+            direction_counts[d] = direction_counts.get(d, 0) + weight
+        
+        # En yaygın yönü bul
+        most_common = max(direction_counts, key=direction_counts.get)
+        most_common_score = direction_counts[most_common]
+        total_score = sum(direction_counts.values())
+        
+        # Yön değişikliği için %60 çoğunluk gerekli
+        if most_common_score / total_score >= 0.60:
+            if most_common != stable_direction:
+                stability_counter += 1
+                # Yön değişikliği için minimum 3 ardışık tutarlılık
+                if stability_counter >= MIN_STABILITY_COUNT:
+                    stable_direction = most_common
+                    stability_counter = 0
+                    print(f"[STABİL] Yön değişti: {stable_direction}")
+            else:
+                stability_counter = 0
+    
+    return stable_direction
 
 
 def get_direction(obstacles: list, frame_width: int, frame_height: int, threshold: float = 0.3) -> str:
@@ -288,21 +393,39 @@ def get_direction(obstacles: list, frame_width: int, frame_height: int, threshol
     for region in ["SOL", "DÜZ", "SAG"]:
         density[region] = region_obstacle_area[region] / region_areas[region] if region_areas[region] > 0 else 0
     
-    # Tüm bölgeler threshold üzerinde doluysa DUR
-    if all(d >= threshold for d in density.values()):
+    # ORTA BÖLGE KONTROLÜ - Sadece ortada engel varsa DUR
+    # Eğer orta bölge doluysa VE sol/sağ da doluysa → DUR
+    # Eğer orta bölge doluysa AMA sol veya sağ açıksa → Yön değiştir
+    
+    orta_dolu = density["DÜZ"] >= threshold
+    sol_acik = density["SOL"] < threshold
+    sag_acik = density["SAG"] < threshold
+    
+    # Eğer ortada engel var ve hiçbir yön açık değilse → DUR
+    if orta_dolu and not sol_acik and not sag_acik:
         return "DUR"
     
-    # En az yoğunluklu bölgeyi bul (öncelik: DÜZ > SOL > SAĞ)
-    min_density = min(density.values())
+    # Eğer ortada engel var ama yan yönler açıksa → Yön değiştir (DUR deme!)
+    if orta_dolu:
+        if sol_acik and sag_acik:
+            # Her iki yön de açık, daha az yoğun olanı seç
+            return "SOL" if density["SOL"] <= density["SAG"] else "SAG"
+        elif sol_acik:
+            return "SOL"
+        elif sag_acik:
+            return "SAG"
     
-    # Öncelik sırası: DÜZ (düz gitmek tercih edilir), sonra SOL, sonra SAG
-    priority_order = ["DÜZ", "SOL", "SAG"]
+    # Orta açıksa → DÜZ git (öncelikli)
+    if density["DÜZ"] < threshold:
+        return "DÜZ"
     
-    for direction in priority_order:
-        if density[direction] == min_density and density[direction] < threshold:
-            return direction
+    # En az yoğunluklu bölgeyi bul (öncelik: SOL > SAĞ)
+    if sol_acik:
+        return "SOL"
+    if sag_acik:
+        return "SAG"
     
-    # Fallback
+    # Hiçbiri açık değilse (bu noktaya gelmemeli ama fallback)
     return "DUR"
 
 
@@ -405,7 +528,7 @@ def main():
     # Kamerayı aç
     print("Kamera aciliyor...")
     # IP Webcam URL
-    ip_camera_url = "http://172.18.161.201:8080/video"
+    ip_camera_url = "http://10.31.248.109:8080/video"
     
     # Standart VideoCapture yerine LatestFrameReader kullanıyoruz
     # Bu sınıf arka planda sürekli okuma yaparak gecikmeyi önler
@@ -423,13 +546,21 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    print("Sistem hazir! Engel tespiti basliyor...")
+    # 3D Navigasyon Haritası
+    nav_map = NavigationMap(grid_size=(80, 80), cell_size=0.1)
+    depth_estimator = DepthEstimator()
+    
+    # RADAR NAVİGASYON SİSTEMİ
+    radar = RadarNavigation(radar_size=400)
+    
+    print("Sistem hazir! Engel tespiti ve RADAR basliyor...")
     print("-" * 50)
     
     frame_count = 0
     last_spoken_direction = None  # Son söylenen yön
     speech_cooldown = 0  # Hemen başla
     danger_cooldown = 0  # Yakın engel uyarısı için cooldown
+    direction_change_count = 0  # Yön değişikliği sayacı
     
     while True:
         ret, frame = cap.read()
@@ -438,63 +569,64 @@ def main():
             time.sleep(0.1)
             continue
         
-        # --- PERFORMANS VE BOYUT DÜZELTME ---
-        # Görüntüyü her zaman 640x480 boyutuna zorla.
-        # Bu hem işlemeyi hızlandırır hem de bölge hesaplamalarının (Sol/Orta/Sağ)
-        # her kamerada doğru çalışmasını sağlar.
+        # Görüntüyü 640x480 boyutuna zorla
         frame = cv2.resize(frame, (640, 480))
         
         frame_count += 1
         frame_height, frame_width = frame.shape[:2]
         
-        # Vision Pipeline ile işle (YOLO + Canny + IPM + Free Space)
+        # Vision Pipeline ile işle
         combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
         
-        # Free Space Maskesini BEV görüntüsüne yeşil overlay olarak ekle
-        # Maskenin beyaz olduğu yerleri (boş alanları) yeşil yap
+        # Free Space Overlay
         free_space_overlay = np.zeros_like(bev_view)
         free_space_overlay[free_space_mask > 0] = [0, 255, 0]
-        
-        # BEV görüntüsü ile karıştır
         bev_combined = cv2.addWeighted(bev_view, 0.7, free_space_overlay, 0.3, 0)
         
-        # Tespit edilen engelleri topla
+        # Engelleri topla
         obstacles = []
-        
         for item in pipeline_obstacles:
             x1, y1, x2, y2, class_name, confidence = item
             
-            # Tüm tespit edilen nesneler engel kabul edilecek
+            # Bounding box'ı frame sınırları içinde tut (taşma önleme)
+            x1 = max(0, min(x1, frame_width - 1))
+            y1 = max(0, min(y1, frame_height - 1))
+            x2 = max(0, min(x2, frame_width))
+            y2 = max(0, min(y2, frame_height))
+            
+            # Geçersiz box kontrolü (genişlik/yükseklik 0 veya negatif olmasın)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
             obstacles.append((x1, y1, x2, y2))
             
-            # Mesafe tahmini (Perspektif tabanlı - y2 kullanılarak)
-            distance, dist_category = estimate_distance(y2, frame_height)
+            # Mesafe tahmini (bbox boyutu ile birlikte)
+            bbox_height = y2 - y1
+            distance, dist_category = estimate_distance(y2, frame_height, bbox_height)
             
-            # Mesafeye göre renk belirle
-            if dist_category == "YAKIN":
-                box_color = (0, 0, 255)  # Kırmızı - tehlikeli
+            # Renk belirleme (COK_YAKIN dahil)
+            if dist_category in ["YAKIN", "COK_YAKIN"]:
+                box_color = (0, 0, 255)  # Kırmızı
             elif dist_category == "ORTA":
-                box_color = (0, 165, 255)  # Turuncu - dikkat
+                box_color = (0, 165, 255)  # Turuncu
             else:
-                box_color = (0, 255, 0)  # Yeşil - güvenli
+                box_color = (0, 255, 0)  # Yeşil
             
-            # Bounding box çiz (Combined view üzerine)
+            # Bounding box çiz (sınırlar içinde)
             cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
             
-            # Etiket (mesafe ile birlikte)
+            # Label pozisyonu (üstte yer yoksa altta göster)
             label = f"{class_name}: {distance:.1f}m"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(combined_view, (x1, y1 - label_size[1] - 10), 
-                          (x1 + label_size[0], y1), box_color, -1)
-            cv2.putText(combined_view, label, (x1, y1 - 5), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            label_y = y1 - 5 if y1 > 20 else y2 + 15
+            cv2.putText(combined_view, label, (x1, label_y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
         
         # En yakın engeli bul
         min_distance, closest_category, closest_bbox = get_closest_obstacle(obstacles, frame_height)
         
-        # Yön hesapla (Yeni Algoritma: Free Space Maskesi üzerinden)
-        direction = pipeline.find_best_direction(free_space_mask)
-        # Eski yöntem: direction = get_direction(obstacles, frame_width, frame_height)
+        # Yön hesapla ve STABİLİZE ET (kör kullanıcı için kritik)
+        raw_direction = pipeline.find_best_direction(free_space_mask)
+        direction = stabilize_direction(raw_direction)  # Stabil yön
         
         # Cooldown azalt
         if speech_cooldown > 0:
@@ -502,53 +634,124 @@ def main():
         if danger_cooldown > 0:
             danger_cooldown -= 1
         
-        # Yakın engel uyarısı (ayrı cooldown ile)
-        if closest_category == "YAKIN" and danger_cooldown <= 0:
-            print("UYARI: Çok yakın engel!")
-            speech_queue.put("YAKIN")
-            danger_cooldown = 60  # 2 saniye cooldown
+        # --- KÖR KULLANICI İÇİN OPTİMİZE SESLİ UYARI SİSTEMİ ---
+        # UZUN COOLDOWN'LAR - Sakin ve anlaşılır komutlar
         
-        # Sürekli yön söyleme (her 3 saniyede bir)
-        if speech_cooldown <= 0:
-            print(f"Ses komutu kuyruğa eklendi: {direction}")
-            
-            # Kuyruğu temizle ve yeni komutu ekle
+        # Ortada engel var mı kontrol et (DUR için gerekli)
+        orta_engel_var = False
+        if closest_bbox is not None:
+            cx = (closest_bbox[0] + closest_bbox[2]) // 2  # Engel merkezi X
+            left_end = frame_width // 3
+            right_start = 2 * frame_width // 3
+            orta_engel_var = left_end <= cx <= right_start
+        
+        # 1. ACİL DURUM: ÇOK YAKIN + ORTADA (en yüksek öncelik)
+        if closest_category == "COK_YAKIN" and orta_engel_var and danger_cooldown <= 0:
             while not speech_queue.empty():
-                try:
-                    speech_queue.get_nowait()
-                except:
-                    pass
-            speech_queue.put(direction)
-            
-            last_spoken_direction = direction
-            speech_cooldown = 90  # 90 kare (yaklaşık 3 saniye) cooldown
+                try: speech_queue.get_nowait()
+                except: pass
+            speech_queue.put("COK_YAKIN")
+            danger_cooldown = 90   # 3 saniye - acil uyarılar arası
+            speech_cooldown = 90
+            print(f"ACİL: Çok yakın engel ORTADA! ({min_distance:.1f}m)")
         
-        # Bölgeleri ve yönü çiz
+        # 2. DUR komutu (sadece ORTADA engel varsa ve tüm yönler kapalıysa)
+        elif raw_direction == "DUR" and orta_engel_var and danger_cooldown <= 0:
+            while not speech_queue.empty():
+                try: speech_queue.get_nowait()
+                except: pass
+            speech_queue.put("DUR")
+            danger_cooldown = 90   # 3 saniye
+            speech_cooldown = 90
+            print("ACİL: DUR komutu - Ortada engel!")
+        
+        # 3. YAKIN ENGEL UYARISI (sadece ORTADA yakın engel varsa)
+        elif closest_category == "YAKIN" and orta_engel_var and min_distance is not None and min_distance < 2.0 and danger_cooldown <= 0:
+            while not speech_queue.empty():
+                try: speech_queue.get_nowait()
+                except: pass
+            speech_queue.put("YAKIN")
+            danger_cooldown = 120  # 4 saniye
+            speech_cooldown = 120
+            print(f"UYARI: Yakın engel ORTADA ({min_distance:.1f}m)")
+        
+        # 4. YÖN DEĞİŞİKLİĞİ (stabilize edilmiş - yavaş değişim)
+        elif direction != last_spoken_direction and speech_cooldown <= 0:
+            while not speech_queue.empty():
+                try: speech_queue.get_nowait()
+                except: pass
+            speech_queue.put(direction)
+            last_spoken_direction = direction
+            speech_cooldown = 150  # 5 saniye - yön değişiklikleri arası
+            print(f"Yön: {direction}")
+        
+        # 5. YOL AÇIK BİLDİRİMİ (engel yokken)
+        elif len(obstacles) == 0 and speech_cooldown <= 0 and last_spoken_direction != "ACIK":
+            speech_queue.put("ACIK")
+            last_spoken_direction = "ACIK"
+            speech_cooldown = 180  # 6 saniye
+            print("Bilgi: Yol açık")
+        
+        # 6. PERİYODİK HATIRLATMA (her 5 saniyede)
+        elif speech_cooldown <= 0 and raw_direction not in ["DUR"] and direction not in ["ACIK"]:
+            while not speech_queue.empty():
+                try: speech_queue.get_nowait()
+                except: pass
+            speech_queue.put(direction)
+            speech_cooldown = 150  # 5 saniye
+        
+        # === RADAR NAVİGASYON SİSTEMİ ===
+        # YOLO engellerini radar'a aktar (mesafe bilgisi ile)
+        radar_obstacles = []
+        for item in pipeline_obstacles:
+            x1, y1, x2, y2, class_name, confidence = item
+            bbox_height = y2 - y1
+            dist, _ = estimate_distance(y2, frame_height, bbox_height)
+            radar_obstacles.append((x1, y1, x2, y2, class_name, dist))
+        
+        # Radar'ı güncelle ve görselleştir
+        radar_img, radar_direction, radar_info = radar.process_frame(
+            radar_obstacles, 
+            frame_width, 
+            frame_height
+        )
+        
+        # Eski navigasyon haritası (isteğe bağlı)
+        nav_obstacles = [(x1, y1, x2, y2) for (x1, y1, x2, y2) in obstacles]
+        nav_vis, nav_command, nav_obstacles_info = nav_map.process_frame(
+            nav_obstacles, 
+            free_space_mask, 
+            frame_width, 
+            frame_height
+        )
+        
+        # Görselleştirme
         combined_view = draw_regions(combined_view, direction)
         
-        # Mesafe bilgisi göster
+        # Bilgi göster
         if min_distance is not None:
-            distance_color = (0, 0, 255) if closest_category == "YAKIN" else (0, 255, 255) if closest_category == "ORTA" else (0, 255, 0)
-            cv2.putText(combined_view, f"En Yakin: {min_distance:.1f}m", (10, frame_height - 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, distance_color, 2)
-        else:
-            cv2.putText(combined_view, "En Yakin: Yok", (10, frame_height - 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            dist_color = (0, 0, 255) if closest_category in ["YAKIN", "COK_YAKIN"] else (0, 255, 255) if closest_category == "ORTA" else (0, 255, 0)
+            cv2.putText(combined_view, f"Mesafe: {min_distance:.1f}m", (10, frame_height - 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, dist_color, 2)
         
-        # Engel sayısını göster
-        cv2.putText(combined_view, f"Engel Sayisi: {len(obstacles)}", (10, frame_height - 20), 
+        cv2.putText(combined_view, f"Engel: {len(obstacles)}", (10, frame_height - 20), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # FPS göster (her 30 karede bir)
+        # Radar yön bilgisi ana ekrana ekle
+        cv2.putText(combined_view, f"Radar: {radar_direction}", (frame_width - 150, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        # Debug (her 30 karede)
         if frame_count % 30 == 0:
             dist_str = f"{min_distance:.1f}m" if min_distance else "Yok"
-            print(f"Kare: {frame_count} | Engel: {len(obstacles)} | Yon: {direction} | Mesafe: {dist_str}")
+            print(f"Kare: {frame_count} | Engel: {len(obstacles)} | Radar: {radar_direction} | Stabil: {direction}")
         
-        # Görüntüyü göster
-        cv2.imshow("YOLOv11 Engel Tespit - Yon Belirleme", combined_view)
-        cv2.imshow("Kus Bakisi (BEV) - Free Space", bev_combined)
+        # Görüntüleri göster
+        cv2.imshow("Akilli Asistan - Yonlendirme", combined_view)
+        cv2.imshow("Kus Bakisi (BEV)", bev_combined)
+        cv2.imshow("RADAR Navigasyon", radar_img)
         
-        # Çıkış için 'q' tuşu
+        # Çıkış
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("\nProgram sonlandiriliyor...")
             break

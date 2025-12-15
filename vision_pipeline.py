@@ -22,12 +22,16 @@ class VisionPipeline:
         self.ipm_height = 0
         
         # --- AKIL KATMANI (Memory) ---
-        # Son 7 karenin yön kararını saklar (Karar Stabilizasyonu için)
-        self.direction_memory = deque(maxlen=7)
+        # Son 5 karenin yön kararını saklar (Daha hızlı tepki)
+        self.direction_memory = deque(maxlen=5)
         
         # Zemin rengi adaptasyonu için hareketli ortalama
         self.floor_color_mean = None
         self.floor_color_std = None
+        
+        # Son tespit edilen engeller (Kararlılık için)
+        self.last_obstacles = []
+        self.obstacle_history = deque(maxlen=3)
 
     def init_ipm(self, width, height):
         """
@@ -215,94 +219,121 @@ class VisionPipeline:
             
         return mask
 
-    def find_best_direction(self, free_space_mask):
+    def find_best_direction(self, free_space_mask, obstacles=None):
         """
         Free space maskesine göre en güvenli yönü belirler.
-        AKILLI KARAR: Geçmiş kararları hatırlar ve titremeyi önler.
-        AĞIRLIKLI PUANLAMA: Yakındaki boşluklar uzaktakilerden daha değerlidir.
+        OPTİMİZE EDİLMİŞ VERSİYON:
+        - Yakın engellere daha yüksek öncelik
+        - Daha hızlı tepki süresi
+        - Daha akıllı karar mekanizması
         """
         height, width = free_space_mask.shape
         
-        # Ağırlık Matrisi (Gradient) oluştur
-        # Aşağısı (Yakın) = 1.0, Yukarısı (Uzak) = 0.1
-        # Bu sayede yakındaki engeller/boşluklar kararı domine eder.
-        weights = np.linspace(0.1, 1.0, height).reshape(-1, 1)
+        # Ağırlık Matrisi - Alt kısım (yakın) daha önemli
+        # Üstten alta doğru artan ağırlık (0.2 -> 1.5)
+        weights = np.linspace(0.2, 1.5, height).reshape(-1, 1)
         
-        # Maskeyi normalize et (0-1) ve ağırlıkla çarp
-        # free_space_mask: 0 (Engel) veya 255 (Boş)
+        # Maskeyi normalize et ve ağırlıkla çarp
         weighted_mask = (free_space_mask / 255.0) * weights
         
         # 3 şerit (Sol, Orta, Sağ)
         w_third = width // 3
         
+        # Her şerit için skor hesapla
         left_strip = weighted_mask[:, :w_third]
         center_strip = weighted_mask[:, w_third:2*w_third]
         right_strip = weighted_mask[:, 2*w_third:]
         
-        # Skorlar (Ağırlıklı Toplam)
         scores = {
             "SOL": np.sum(left_strip),
             "DÜZ": np.sum(center_strip),
             "SAG": np.sum(right_strip)
         }
         
-        # Maksimum olası skor (Her şerit için)
-        max_possible_score = np.sum(weights) * w_third
+        # ALT YARI ANALİZİ (Kritik Bölge - Yakın mesafe)
+        # Alt yarıdaki engel durumuna bak
+        bottom_half = free_space_mask[height//2:, :]
+        bottom_left = np.sum(bottom_half[:, :w_third]) / 255.0
+        bottom_center = np.sum(bottom_half[:, w_third:2*w_third]) / 255.0
+        bottom_right = np.sum(bottom_half[:, 2*w_third:]) / 255.0
         
-        # Doluluk oranları (0.0 - 1.0)
+        bottom_scores = {
+            "SOL": bottom_left,
+            "DÜZ": bottom_center,
+            "SAG": bottom_right
+        }
+        
+        # Maksimum skor
+        max_possible_score = np.sum(weights) * w_third
+        max_bottom_score = (height // 2) * w_third
+        
+        # Doluluk oranları
         ratios = {k: v / max_possible_score for k, v in scores.items()}
+        bottom_ratios = {k: v / max_bottom_score for k, v in bottom_scores.items()}
         
         current_decision = "DUR"
         
-        # Eşik Değeri: %20'den az güvenli alan varsa DUR
-        if all(r < 0.20 for r in ratios.values()):
+        # ACİL DURUM: Alt yarıda hiç boşluk yoksa DUR
+        if all(r < 0.15 for r in bottom_ratios.values()):
+            current_decision = "DUR"
+        # NORMAL KARAR
+        elif all(r < 0.15 for r in ratios.values()):
             current_decision = "DUR"
         else:
-            # En iyi skoru bul
-            best_direction = max(scores, key=scores.get)
+            # Hibrit Skor: %70 genel + %30 yakın bölge
+            hybrid_scores = {}
+            for key in scores:
+                hybrid_scores[key] = (scores[key] * 0.7) + (bottom_scores[key] * 0.3 * max_possible_score / max_bottom_score)
             
-            # "DÜZ" gitmek için tolerans (Histeresis)
-            # Eğer DÜZ skoru, en iyinin %80'i kadarsa bile DÜZ git.
-            if scores["DÜZ"] >= scores[best_direction] * 0.80:
+            best_direction = max(hybrid_scores, key=hybrid_scores.get)
+            
+            # DÜZ gitme toleransı (%75 - biraz daha esnek)
+            if hybrid_scores["DÜZ"] >= hybrid_scores[best_direction] * 0.75:
                 current_decision = "DÜZ"
             else:
                 current_decision = best_direction
         
-        # --- AKIL KATMANI (Karar Stabilizasyonu) ---
+        # --- KARAR STABİLİZASYONU ---
         self.direction_memory.append(current_decision)
         
-        # Son 5 kararın en çok tekrar edeni (Daha hızlı tepki için 7'den 5'e düşürdüm)
-        most_common_decision = Counter(self.direction_memory).most_common(1)[0][0]
+        # ACİL DURUM: DUR komutu her zaman öncelikli
+        if current_decision == "DUR":
+            return "DUR"
         
-        return most_common_decision
+        # Son 3 karar aynıysa değiştir (Daha hızlı tepki)
+        if len(self.direction_memory) >= 3:
+            last_three = list(self.direction_memory)[-3:]
+            if last_three.count(current_decision) >= 2:
+                return current_decision
+        
+        # Aksi halde en çok tekrar eden kararı ver
+        most_common = Counter(self.direction_memory).most_common(1)[0][0]
+        return most_common
 
     def process_frame(self, frame):
         """
         Bir kareyi işler: YOLO tespiti + Akıllı Zemin Tespiti + IPM.
+        OPTİMİZE EDİLMİŞ VERSİYON
         """
-        # 1. YOLO Nesne Tespiti (TRACKING MODU - Nesne Takibi)
-        # persist=True: Nesne ID'lerini korur (Hafıza)
-        results = self.model.track(frame, verbose=False, conf=0.4, persist=True)
+        # 1. YOLO Nesne Tespiti (TRACKING MODU)
+        results = self.model.track(frame, verbose=False, conf=0.35, persist=True)
         
-        # 2. Akıllı Zemin Tespiti (Renk + Kenar)
-        # Eski yöntem yerine bunu kullanıyoruz
+        # 2. Akıllı Zemin Tespiti
         smart_floor_mask = self.detect_smart_floor(frame)
         
-        # 3. Canny Kenar Tespiti (Görselleştirme ve yedek için)
+        # 3. Canny Kenar Tespiti (Yedek)
         edges = self.detect_edges(frame)
         
-        # 4. IPM Dönüşümü (Zemin Maskesi üzerinde)
-        # Zemin maskesini kuş bakışına çevir
+        # 4. IPM Dönüşümü
         bev_mask = self.apply_ipm(smart_floor_mask)
         bev_view = cv2.cvtColor(bev_mask, cv2.COLOR_GRAY2BGR)
         
-        # Free Space Maskesi artık doğrudan BEV maskesi
         free_space_mask = bev_mask
         
         # Görselleştirme
         combined_view = frame.copy()
         
-        # Zemini yeşil boya (Overlay)
+        # Zemini yeşil boya
         floor_overlay = np.zeros_like(frame)
         floor_overlay[smart_floor_mask == 255] = [0, 255, 0]
         combined_view = cv2.addWeighted(combined_view, 1.0, floor_overlay, 0.3, 0)
@@ -314,18 +345,18 @@ class VisionPipeline:
             boxes = result.boxes
             if boxes is not None:
                 for box in boxes:
-                    # Koordinatlar
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                     cls = int(box.cls[0])
                     conf = float(box.conf[0])
                     label = self.model.names[cls]
                     
-                    # ID varsa al (Tracking sayesinde)
-                    track_id = int(box.id[0]) if box.id is not None else -1
-                    
                     obstacles.append((x1, y1, x2, y2, label, conf))
 
-        # 5. Hibrit Engel Haritası: YOLO engellerini maskeden çıkar
+        # Engel geçmişini güncelle
+        self.obstacle_history.append(len(obstacles))
+        self.last_obstacles = obstacles
+
+        # 5. YOLO engellerini maskeden çıkar
         free_space_mask = self.update_mask_with_obstacles(free_space_mask, obstacles)
 
         return combined_view, obstacles, edges, bev_view, free_space_mask

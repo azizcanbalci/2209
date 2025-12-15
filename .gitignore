@@ -39,3 +39,4 @@ runs/
 Thumbs.db
 # audio_cache
 audio_cache/
+.env

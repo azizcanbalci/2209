@@ -8,10 +8,12 @@ import time
 import os
 from gtts import gTTS
 import pygame
+from dotenv import load_dotenv
 from services.voice_chat import VoiceChatAgent
 
 # --- AYARLAR ---
-GEMINI_API_KEY = "BURAYA_API_KEY_GELECEK" # Kullanıcıdan alınacak
+load_dotenv()  # .env dosyasını yükle
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # --- IP KAMERA İÇİN HIZLANDIRICI SINIF ---
 class LatestFrameReader:
@@ -394,10 +396,10 @@ def main():
     
     # Sesli Sohbet Ajanı (Başlangıçta pasif)
     voice_agent = None
-    if GEMINI_API_KEY != "BURAYA_API_KEY_GELECEK":
+    if GEMINI_API_KEY:
         voice_agent = VoiceChatAgent(GEMINI_API_KEY)
     else:
-        print("UYARI: Gemini API Key girilmedi! Sohbet modu çalışmayacak.")
+        print("UYARI: Gemini API Key bulunamadı! .env dosyasını kontrol edin.")
 
     # YOLOv11 modelini yükle (VisionPipeline üzerinden)
     print("Vision Pipeline başlatılıyor...")

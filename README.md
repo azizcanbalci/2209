@@ -1,65 +1,102 @@
-# Blind Assist - Gelişmiş Engel Tespit ve Yönlendirme Sistemi
+# Blind Assist - Gelişmiş 7 Modlu Görme Engelli Asistanı
 
-Bu proje, görme engelli bireyler için geliştirilmiş, bilgisayarlı görü (computer vision) tabanlı bir yardımcı asistan prototipidir. **YOLOv11** nesne tespiti, **Canny Kenar Tespiti** ve **Inverse Perspective Mapping (IPM)** tekniklerini birleştirerek çevreyi analiz eder ve kullanıcıya en güvenli yürüme rotasını sesli olarak bildirir.
+Bu proje, görme engelli bireyler için geliştirilmiş, yapay zeka ve bilgisayarlı görü tabanlı kapsamlı bir yardımcı asistan sistemidir.
 
-## 🚀 Özellikler
+## 🚀 7 Mod Sistemi
 
-- **Hibrit Algılama:** YOLOv11 ile nesne tespiti ve Canny Edge Detection ile yol sınırlarının belirlenmesi.
-- **Kuş Bakışı Görünüm (BEV):** IPM (Inverse Perspective Mapping) ile kamera görüntüsünün kuş bakışı haritaya dönüştürülmesi.
-- **Free-Space Analizi:** Yürünebilir güvenli alanların (Free Space) dinamik olarak hesaplanması.
-- **Akıllı Yönlendirme:** Sadece engellere değil, boş alanın genişliğine ve sürekliliğine göre karar veren gelişmiş algoritma.
-- **Sesli Geri Bildirim:** Türkçe sesli komutlar ("Sola dön", "Düz git", "Dikkat! Çok yakın engel" vb.).
-- **Mesafe Tahmini:** Engellerin uzaklığının tahmini ve renk kodlu uyarı sistemi.
+### MOD 1: Navigasyon
+- **YOLOv11** ile nesne tespiti
+- **Radar Navigasyon** sistemi ile yön komutları
+- **Kuş Bakışı Görünüm (BEV)** ile alan haritalaması
+- Sesli yönlendirme: "Sola dön", "Düz git", "Dikkat!"
+
+### MOD 2: Metin Okuma (OCR)
+- **PaddleOCR** ile Türkçe metin tanıma
+- Sayı ve özel karakterleri koruma
+- Manuel tetikleme (SPACE tuşu)
+- Türkçe karakter düzeltmeleri
+
+### MOD 3: Nesne Tanıma
+- Çevredeki nesnelerin detaylı tanımlanması
+- Mesafe tahmini ile yakınlık bilgisi
+- Türkçe nesne isimlendirmesi
+
+### MOD 4: Nesne Arama
+- Belirli bir nesneyi arama
+- Bulunan nesnenin konumu ve uzaklığı
+- Sesli yönlendirme ile hedefe ulaşım
+
+### MOD 5: Sesli AI Sohbet
+- **Mistral-7B** yapay zeka sohbet
+- Sesli komut girişi (mikrofon)
+- Türkçe konuşma tanıma ve sentezi
+
+### MOD 6: Görsel Soru-Cevap
+- **Gemini 2.5 Flash** görsel analiz
+- Fotoğraf hakkında soru sorma
+- Detaylı görsel açıklamalar
+
+### MOD 7: 3D Haritalama (SLAM)
+- **Monocular Visual SLAM** ile 3D haritalama
+- ORB özellik çıkarımı ve eşleştirme
+- Essential Matrix ve Triangulation
+- PLY formatında harita kaydetme/yükleme
+- Kuş bakışı harita görselleştirmesi
 
 ## 🛠️ Kurulum
 
-1.  Gerekli kütüphaneleri yükleyin:
+```powershell
+# Gerekli kütüphaneleri yükleyin
+pip install -r requirements.txt
 
-    ```powershell
-    pip install -r requirements.txt
-    ```
-
-2.  PyTorch ve GPU desteği (Opsiyonel ama önerilir):
-    Sistem CPU üzerinde çalışabilir ancak daha yüksek FPS için CUDA destekli PyTorch önerilir.
+# .env dosyasını oluşturun ve API anahtarlarını ekleyin
+# HUGGINGFACE_TOKEN=your_token
+# GEMINI_API_KEY=your_key
+```
 
 ## ▶️ Çalıştırma
-
-Uygulamayı başlatmak için:
 
 ```powershell
 python main.py
 ```
 
-Çıkış yapmak için `q` tuşuna basabilirsiniz.
+### Tuş Kontrolleri
+- `1-7`: Mod değiştirme
+- `SPACE`: Moda göre tetikleme (OCR okuma, SLAM kaydetme, soru sorma)
+- `q`: Çıkış
 
-## 🏗️ Sistem Mimarisi
-
-Sistem `VisionPipeline` sınıfı üzerinden modüler bir yapıda çalışır:
-
-1.  **Görüntü Alımı:** Kameradan kare okunur.
-2.  **YOLO Inference:** `ultralytics` kütüphanesi ile engeller (insan, araba, sandalye vb.) tespit edilir.
-3.  **Edge Detection:** `Canny` algoritması ile yol kenarları ve yapısal sınırlar belirlenir.
-4.  **IPM Dönüşümü:** Görüntü perspektifi kaldırılarak 2D kuş bakışı harita oluşturulur.
-5.  **Maske Oluşturma:**
-    - Kenarlar kalınlaştırılır.
-    - YOLO kutuları BEV düzlemine izdüşürülür.
-    - Güvenli alanlar (Free Space) beyaz, engeller siyah olarak maskelenir.
-6.  **Yol Planlama:** Maske üzerindeki en geniş ve engelsiz şerit (Sol, Orta, Sağ) seçilir.
-7.  **Geri Bildirim:** Karar verilen yön sesli olarak kullanıcıya iletilir.
+### MOD 7 Özel Kontrolleri
+- `SPACE`: Haritayı kaydet
+- `L`: Harita yükle
+- `R`: Haritayı sıfırla
+- `I`: İstatistikleri göster
 
 ## 📂 Dosya Yapısı
 
-- `main.py`: Ana uygulama döngüsü, ses sistemi ve görselleştirme.
-- `vision_pipeline.py`: Görüntü işleme, IPM, maske oluşturma ve yön bulma mantığı.
-- `models/`: YOLO model dosyalarının bulunduğu klasör.
-- `audio_cache/`: Oluşturulan ses dosyalarının (MP3) önbelleği.
-- `AGENTIC.MD`: Proje geliştirme yol haritası ve teknik dokümantasyon.
+```
+├── main.py                 # Ana uygulama
+├── vision_pipeline.py      # YOLO ve görüntü işleme
+├── radar_navigation.py     # Radar navigasyon sistemi
+├── navigation_map.py       # Navigasyon haritalaması
+├── services/
+│   ├── ocr_reader.py       # PaddleOCR Türkçe OCR
+│   ├── object_describer.py # Nesne tanımlayıcı
+│   ├── object_searcher.py  # Nesne arama
+│   ├── voice_chat.py       # Mistral sesli sohbet
+│   ├── image_qa.py         # Gemini görsel soru-cevap
+│   └── slam_mapper.py      # 3D SLAM haritalama
+├── models/                 # YOLO model dosyaları
+├── audio_cache/            # Ses dosyaları önbelleği
+└── maps/                   # Kaydedilen SLAM haritaları
+```
 
 ## 🔧 Gereksinimler
 
-- Python 3.8+
-- OpenCV (`opencv-python`)
-- Ultralytics YOLO (`ultralytics`)
-- NumPy
-- gTTS (Google Text-to-Speech)
-- Pygame (Ses çalma için)
+- Python 3.10+
+- OpenCV, NumPy, SciPy
+- Ultralytics (YOLOv11)
+- PaddleOCR, PaddlePaddle
+- gTTS, Pygame
+- SpeechRecognition, PyAudio
+- google-generativeai (Gemini)
+- plyfile (PLY formatı)

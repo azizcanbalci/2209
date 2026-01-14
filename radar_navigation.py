@@ -124,71 +124,151 @@ class RadarNavigation:
         if self.closest_obstacles[region] is None or distance < self.closest_obstacles[region]['distance']:
             self.closest_obstacles[region] = self.obstacles[-1]
     
+    def analyze_path_curvature(self):
+        """
+        Safe path'in kıvrımlarını analiz et.
+        Her segment için yön değişimini hesapla.
+        
+        Returns:
+            list: [(segment_index, turn_direction, turn_intensity), ...]
+        """
+        if len(self.safe_path) < 3:
+            return []
+        
+        curves = []
+        for i in range(1, len(self.safe_path) - 1):
+            prev_pt = self.safe_path[i - 1]
+            curr_pt = self.safe_path[i]
+            next_pt = self.safe_path[i + 1]
+            
+            # Önceki ve sonraki segment vektörleri
+            vec1_x = curr_pt[0] - prev_pt[0]
+            vec1_y = curr_pt[1] - prev_pt[1]
+            vec2_x = next_pt[0] - curr_pt[0]
+            vec2_y = next_pt[1] - curr_pt[1]
+            
+            # X değişimi (kıvrım yönü)
+            x_change = vec2_x - vec1_x
+            
+            if abs(x_change) > 5:  # Anlamlı kıvrım
+                direction = "SOL" if x_change < 0 else "SAG"
+                intensity = min(abs(x_change) / 20, 1.0)  # 0-1 arası yoğunluk
+                curves.append((i, direction, intensity))
+        
+        return curves
+    
+    def get_upcoming_turn(self):
+        """
+        Yaklaşan kıvrımı tespit et.
+        
+        Returns:
+            tuple: (turn_direction, distance_to_turn, intensity) veya None
+        """
+        curves = self.analyze_path_curvature()
+        
+        if not curves:
+            return None
+        
+        # İlk anlamlı kıvrımı bul (yoğunluğu 0.3'ten büyük)
+        for segment_idx, direction, intensity in curves:
+            if intensity > 0.3:
+                # Kıvrıma olan mesafe (segment sayısı * adım uzunluğu)
+                distance = segment_idx * 0.5  # Her segment ~0.5m
+                return (direction, distance, intensity)
+        
+        return None
+    
     def calculate_safe_direction(self):
         """
-        Radar verilerine göre en güvenli yönü hesapla.
+        SAFE PATH KIVIRIMLARINI TAKİP EDEN YÖN HESAPLAMA
+        Radar'daki sarı yolu kıvrımlarıyla birlikte takip eder.
         
         Returns:
             str: "DÜZ", "SOL", "SAG", "HAFIF_SOL", "HAFIF_SAG", "DUR"
         """
-        sol_score = self.region_scores['SOL']
-        orta_score = self.region_scores['ORTA']
-        sag_score = self.region_scores['SAG']
+        # Önce safe path'i hesapla
+        self.calculate_safe_path()
         
         # En yakın engel mesafeleri
         sol_dist = self.closest_obstacles['SOL']['distance'] if self.closest_obstacles['SOL'] else 10
         orta_dist = self.closest_obstacles['ORTA']['distance'] if self.closest_obstacles['ORTA'] else 10
         sag_dist = self.closest_obstacles['SAG']['distance'] if self.closest_obstacles['SAG'] else 10
         
-        # ACİL DURUM: Ortada çok yakın engel
-        if orta_dist < 1.5:
-            # Ortada engel var, kaçış yönü bul
-            if sol_score < sag_score and sol_dist > 2.0:
+        # ACİL DURUM: Ortada çok yakın engel (1m içinde)
+        if orta_dist < 1.0:
+            if sol_dist > sag_dist and sol_dist > 1.5:
                 return "SOL"
-            elif sag_dist > 2.0:
-                return "SAG"
-            elif sol_dist > sag_dist:
-                return "SOL"
-            elif sag_dist > sol_dist:
+            elif sag_dist > 1.5:
                 return "SAG"
             else:
                 return "DUR"
         
-        # Ortada engel yok veya uzak
-        if orta_score < 2.0 and orta_dist > 3.0:
-            return "DÜZ"
-        
-        # Orta riskli, en az tehlikeli yönü bul
-        scores = [
-            ('SOL', sol_score, sol_dist),
-            ('ORTA', orta_score, orta_dist),
-            ('SAG', sag_score, sag_dist)
-        ]
-        
-        # Skora göre sırala (düşük skor = güvenli)
-        scores.sort(key=lambda x: (x[1], -x[2]))  # Önce düşük skor, sonra uzak mesafe
-        
-        best_direction = scores[0][0]
-        best_score = scores[0][1]
-        best_dist = scores[0][2]
-        
-        # Eğer en iyi yön bile tehlikeliyse
-        if best_dist < 1.0:
-            return "DUR"
-        
-        # Hafif yön değişikliği mi gerekiyor?
-        if best_direction == 'ORTA':
-            return "DÜZ"
-        elif best_direction == 'SOL':
-            if sol_score < orta_score * 0.5:  # Çok daha güvenli
+        # SAFE PATH KIVIRIMLARINI ANALİZ ET
+        if len(self.safe_path) >= 3:
+            # Yaklaşan kıvrımı kontrol et
+            upcoming_turn = self.get_upcoming_turn()
+            
+            if upcoming_turn:
+                turn_dir, turn_dist, turn_intensity = upcoming_turn
+                
+                # Kıvrım çok yakınsa (1.5m içinde) - hemen dön
+                if turn_dist < 1.5:
+                    if turn_intensity > 0.6:  # Keskin kıvrım
+                        return turn_dir
+                    else:  # Hafif kıvrım
+                        return f"HAFIF_{turn_dir}"
+                
+                # Kıvrım biraz ileride (1.5-3m) - hafif dönmeye başla
+                elif turn_dist < 3.0 and turn_intensity > 0.5:
+                    return f"HAFIF_{turn_dir}"
+            
+            # Kıvrım yoksa veya uzakta - mevcut yol yönünü takip et
+            # İlk birkaç noktanın ortalama yönünü hesapla
+            path_points = self.safe_path[:min(5, len(self.safe_path))]
+            
+            # Ağırlıklı X kayması hesapla
+            total_x_shift = 0
+            total_weight = 0
+            for i, (px, py) in enumerate(path_points):
+                x_diff = px - self.user_x
+                weight = 1.0 + (len(path_points) - i) * 0.5  # Yakın noktalar daha önemli
+                total_x_shift += x_diff * weight
+                total_weight += weight
+            
+            avg_x_shift = total_x_shift / total_weight if total_weight > 0 else 0
+            
+            # X kaymasına göre yön belirle
+            if avg_x_shift < -25:  # Güçlü sola
                 return "SOL"
-            else:
+            elif avg_x_shift < -8:  # Hafif sola
                 return "HAFIF_SOL"
-        else:  # SAG
-            if sag_score < orta_score * 0.5:
+            elif avg_x_shift > 25:  # Güçlü sağa
                 return "SAG"
-            else:
+            elif avg_x_shift > 8:  # Hafif sağa
                 return "HAFIF_SAG"
+            else:
+                return "DÜZ"
+        
+        # Safe path yoksa bölge skorlarına bak
+        sol_score = self.region_scores['SOL']
+        orta_score = self.region_scores['ORTA']
+        sag_score = self.region_scores['SAG']
+        
+        # Hiç engel yoksa düz git
+        if sol_score == 0 and orta_score == 0 and sag_score == 0:
+            return "DÜZ"
+        
+        # Ortada engel yoksa düz
+        if orta_score < 1.0 and orta_dist > 3.0:
+            return "DÜZ"
+        
+        # En güvenli bölgeye yönlen
+        if sol_score < orta_score and sol_score < sag_score:
+            return "SOL" if sol_score < orta_score * 0.5 else "HAFIF_SOL"
+        elif sag_score < orta_score:
+            return "SAG" if sag_score < orta_score * 0.5 else "HAFIF_SAG"
+        
+        return "DÜZ"
     
     def get_stable_direction(self):
         """
@@ -293,13 +373,48 @@ class RadarNavigation:
             cv2.rectangle(overlay, (x_range[0], 0), (x_range[1], self.user_y - 20), color, -1)
             radar = cv2.addWeighted(radar, 0.7, overlay, 0.3, 0)
         
-        # Güvenli yolu çiz
+        # Güvenli yolu çiz (KALIN SARI ÇİZGİ)
         self.calculate_safe_path()
         if len(self.safe_path) > 1:
+            # Yol çizgisi - segment segment farklı kalınlıkta
             for i in range(len(self.safe_path) - 1):
                 pt1 = self.safe_path[i]
                 pt2 = self.safe_path[i + 1]
-                cv2.line(radar, pt1, pt2, self.colors['path'], 2)
+                # Yakın segmentler daha kalın
+                thickness = max(2, 4 - i // 5)
+                cv2.line(radar, pt1, pt2, self.colors['path'], thickness)
+            
+            # Yol başlangıcında ok işareti (yönü göster)
+            if len(self.safe_path) >= 2:
+                start_pt = (self.user_x, self.user_y - 20)
+                end_pt = self.safe_path[min(3, len(self.safe_path)-1)]
+                cv2.arrowedLine(radar, start_pt, end_pt, (0, 255, 255), 3, tipLength=0.3)
+            
+            # KIVIRIM NOKTALARINI İŞARETLE
+            curves = self.analyze_path_curvature()
+            for segment_idx, turn_dir, intensity in curves:
+                if intensity > 0.3 and segment_idx < len(self.safe_path):
+                    curve_pt = self.safe_path[segment_idx]
+                    # Kıvrım noktasını işaretle (turuncu daire)
+                    curve_color = (0, 165, 255)  # Turuncu
+                    radius = int(5 + intensity * 10)
+                    cv2.circle(radar, curve_pt, radius, curve_color, 2)
+                    
+                    # Kıvrım yönünü göster
+                    arrow_offset = 15 if turn_dir == "SAG" else -15
+                    cv2.arrowedLine(radar, curve_pt, 
+                                   (curve_pt[0] + arrow_offset, curve_pt[1]),
+                                   curve_color, 2, tipLength=0.5)
+        
+        # Yaklaşan kıvrım uyarısı
+        upcoming = self.get_upcoming_turn()
+        if upcoming:
+            turn_dir, turn_dist, turn_int = upcoming
+            if turn_dist < 3.0:  # 3m içindeki kıvrımlar
+                warn_text = f"KIVIRIM: {turn_dir} ({turn_dist:.1f}m)"
+                warn_color = (0, 165, 255) if turn_dist > 1.5 else (0, 0, 255)
+                cv2.putText(radar, warn_text, (10, 40), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, warn_color, 1)
         
         # Engelleri çiz
         for obs in self.obstacles:

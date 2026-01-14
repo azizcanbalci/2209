@@ -10,6 +10,16 @@ import time
 import os
 from gtts import gTTS
 import pygame
+import uuid
+import tempfile
+
+# Servisler
+from services.ocr_reader import ocr_reader, read_text
+from services.object_describer import describe_objects, get_turkish_name
+from services.object_searcher import search_object, get_available_objects
+from services import voice_chat  # MOD 5: Sesli AI Sohbet
+from services import image_qa  # MOD 6: Görsel Soru-Cevap (Gemini)
+from services import slam_mapper  # MOD 7: 3D Harita (SLAM)
 
 # --- IP KAMERA İÇİN HIZLANDIRICI SINIF ---
 class LatestFrameReader:
@@ -77,6 +87,200 @@ stable_direction = "DÜZ"  # Stabil yön (söylenecek)
 stability_counter = 0  # Aynı yön kaç kez tekrarlandı
 MIN_STABILITY_COUNT = 5  # Yön değişmeden önce minimum tekrar sayısı
 
+# === AKILLI HAFIZA SİSTEMİ ===
+class SmartNavigator:
+    """
+    Akıllı navigasyon hafızası - gerçek zamanlı yönlendirme için
+    """
+    def __init__(self):
+        self.direction_history = deque(maxlen=15)  # Son 15 yön
+        self.last_command = None
+        self.last_command_time = 0
+        self.command_count = {}  # Komut sayaçları
+        self.movement_state = "IDLE"  # IDLE, MOVING, TURNING
+        self.turn_direction = None  # Hangi yöne dönülüyor
+        self.consecutive_same = 0  # Aynı komut kaç kez üst üste geldi
+        
+        # Zaman bazlı ayarlar (saniye cinsinden frame sayısı, 30fps varsayım)
+        self.min_command_interval = 45  # 1.5 saniye - komutlar arası minimum süre
+        self.urgent_interval = 15  # 0.5 saniye - acil durumlar için
+        self.direction_change_threshold = 8  # Yön değişimi için gereken tutarlılık
+        
+    def add_direction(self, direction):
+        """Yeni yön ekle ve analiz et"""
+        self.direction_history.append(direction)
+        
+        # Aynı yön kaç kez tekrarlandı?
+        if len(self.direction_history) >= 2:
+            if self.direction_history[-1] == self.direction_history[-2]:
+                self.consecutive_same += 1
+            else:
+                self.consecutive_same = 1
+        
+    def get_dominant_direction(self):
+        """Son yönlerin baskın olanını bul"""
+        if len(self.direction_history) < 3:
+            return self.direction_history[-1] if self.direction_history else "DÜZ"
+        
+        from collections import Counter
+        recent = list(self.direction_history)[-10:]  # Son 10
+        counts = Counter(recent)
+        
+        # En çok tekrar eden yön
+        most_common = counts.most_common(1)[0]
+        
+        # %40 çoğunluk gerekli
+        if most_common[1] >= len(recent) * 0.4:
+            return most_common[0]
+        
+        return self.direction_history[-1]
+    
+    def should_speak(self, direction, frame_count, is_urgent=False):
+        """
+        Bu komutu söylemeli miyiz?
+        Akıllı karar mekanizması
+        """
+        current_time = frame_count
+        time_since_last = current_time - self.last_command_time
+        
+        # Acil durum (DUR, COK_YAKIN)
+        if is_urgent:
+            if time_since_last >= self.urgent_interval:
+                return True
+            return False
+        
+        # Normal komut
+        if time_since_last < self.min_command_interval:
+            return False
+        
+        # Yön değişikliği kontrolü
+        if direction != self.last_command:
+            # Yeterince tutarlı mı?
+            if self.consecutive_same >= self.direction_change_threshold:
+                return True
+            # Çok farklı bir yön mü? (örn: SOL'dan SAG'a)
+            opposite_pairs = [("SOL", "SAG"), ("HAFIF_SOL", "HAFIF_SAG")]
+            for pair in opposite_pairs:
+                if (self.last_command in pair and direction in pair and 
+                    self.last_command != direction):
+                    # Zıt yönler - daha fazla tutarlılık iste
+                    if self.consecutive_same >= self.direction_change_threshold + 3:
+                        return True
+                    return False
+            return True
+        
+        # Aynı komut - periyodik hatırlatma
+        if time_since_last >= self.min_command_interval * 2:  # 3 saniye
+            return True
+        
+        return False
+    
+    def update_state(self, direction, frame_count):
+        """Durumu güncelle ve söylenecek komutu döndür"""
+        self.add_direction(direction)
+        dominant = self.get_dominant_direction()
+        
+        is_urgent = dominant in ["DUR", "COK_YAKIN"]
+        
+        if self.should_speak(dominant, frame_count, is_urgent):
+            self.last_command = dominant
+            self.last_command_time = frame_count
+            return dominant
+        
+        return None
+
+# Global navigator
+smart_nav = SmartNavigator()
+
+# === MOD YÖNETİCİSİ ===
+class ModeManager:
+    """
+    7 Modlu Asistan Sistemi:
+    1 - Navigasyon Modu (varsayılan)
+    2 - Metin Okuma Modu (PaddleOCR)
+    3 - Nesne Tanıma Modu (YOLO detaylı)
+    4 - Nesne Arama Modu
+    5 - Sesli AI Sohbet Modu (Mistral)
+    6 - Görsel Soru-Cevap Modu (Gemini)
+    7 - 3D Haritalama Modu (SLAM)
+    """
+    MODES = {
+        1: "NAVİGASYON",
+        2: "METİN OKUMA",
+        3: "NESNE TANIMA",
+        4: "NESNE ARAMA",
+        5: "SESLİ AI SOHBET",
+        6: "GÖRSEL SORU-CEVAP",
+        7: "3D HARİTALAMA"
+    }
+    
+    def __init__(self):
+        self.current_mode = 1
+        self.search_target = None  # Mod 4 için aranan nesne
+        self.last_ocr_time = 0
+        self.last_describe_time = 0
+        self.ocr_cooldown = 90  # 3 saniye
+        self.describe_cooldown = 60  # 2 saniye
+        
+    def switch_mode(self, mode_num):
+        """Mod değiştir"""
+        if mode_num in self.MODES:
+            self.current_mode = mode_num
+            return self.MODES[mode_num]
+        return None
+    
+    def get_mode_name(self):
+        """Mevcut mod adını döndür"""
+        return self.MODES.get(self.current_mode, "UNKNOWN")
+
+# Global mod yöneticisi
+mode_manager = ModeManager()
+
+# === GEÇİCİ SES DOSYASI FONKSİYONLARI ===
+# Ses için lock (thread-safe)
+_speech_lock = threading.Lock()
+
+def speak_text_temp(text, lang='tr'):
+    """
+    Metni geçici ses dosyasına çevirip seslendir, sonra sil
+    """
+    if not text or len(text.strip()) == 0:
+        return
+    
+    temp_file = os.path.join(AUDIO_DIR, f"temp_{uuid.uuid4().hex[:8]}.mp3")
+    try:
+        # gTTS ile ses dosyası oluştur
+        tts = gTTS(text=text, lang=lang)
+        tts.save(temp_file)
+        
+        # Thread-safe ses çalma
+        with _speech_lock:
+            pygame.mixer.music.load(temp_file)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+            pygame.mixer.music.unload()
+        
+        time.sleep(0.1)
+        
+        # Dosyayı sil
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            
+        print(f"🔊 Seslendirme tamamlandı: {text[:50]}...")
+    except Exception as e:
+        print(f"❌ Ses hatası: {e}")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+
+def speak_text_async(text, lang='tr'):
+    """Metni arka planda seslendir"""
+    thread = threading.Thread(target=speak_text_temp, args=(text, lang), daemon=True)
+    thread.start()
+
 # Ses dosyaları için klasör
 AUDIO_DIR = "audio_cache"
 if not os.path.exists(AUDIO_DIR):
@@ -85,36 +289,59 @@ if not os.path.exists(AUDIO_DIR):
 def create_audio_files():
     """Başlangıçta ses dosyalarını oluştur - Engelli bireyler için optimize edilmiş"""
     commands = {
-        # Yön komutları - Net ve anlaşılır
-        "SOL": "Sola dönün",
-        "DÜZ": "Düz devam edin, yol açık",
-        "SAG": "Sağa dönün",
-        "HAFIF_SOL": "Hafifçe sola yönelin",
-        "HAFIF_SAG": "Hafifçe sağa yönelin",
+        # Yön komutları - Kısa ve net
+        "SOL": "Sola",
+        "DÜZ": "Düz",
+        "SAG": "Sağa",
+        "HAFIF_SOL": "Hafif sola",
+        "HAFIF_SAG": "Hafif sağa",
         
-        # Uyarı komutları
-        "DUR": "Durun! Önünüzde engel var",
-        "YAKIN": "Dikkat! Yakınınızda engel var, yavaşlayın",
-        "COK_YAKIN": "Durun! Çok yakın engel",
+        # Hareket komutları
+        "ILERLE": "İlerle",
+        "DEVAM": "Devam",
+        
+        # Uyarı komutları - Acil ve net
+        "DUR": "Dur!",
+        "YAKIN": "Dikkat! Engel yakın",
+        "COK_YAKIN": "Dur! Engel çok yakın",
+        
+        # === KAÇIŞ YÖNLÜ ACİL KOMUTLAR ===
+        "DUR_SOL": "Dur! Sola kaç",
+        "DUR_SAG": "Dur! Sağa kaç",
+        "DUR_GERI": "Dur! Geri çekil",
+        "YAKIN_SOL": "Dikkat! Sola yönel",
+        "YAKIN_SAG": "Dikkat! Sağa yönel",
+        "ENGEL_SOL": "Engel solda, sağa git",
+        "ENGEL_SAG": "Engel sağda, sola git",
+        "ENGEL_ORTA": "Engel önde",
+        
+        # === MOD BİLDİRİMLERİ ===
+        "MOD_1": "Navigasyon modu aktif",
+        "MOD_2": "Metin okuma modu aktif",
+        "MOD_3": "Nesne tanıma modu aktif",
+        "MOD_4": "Arama modu aktif. Aramak istediğiniz nesneyi söyleyin",
+        "MOD_5": "Sesli sohbet modu aktif",
+        "MOD_6": "Görsel soru cevap modu aktif",
+        "MOD_7": "Üç boyutlu haritalama modu aktif",
+        "METIN_YOK": "Metin bulunamadı",
+        "NESNE_YOK": "Görüş alanında nesne yok",
+        "BULUNAMADI": "Aranan nesne bulunamadı",
         
         # Bilgi komutları
-        "HAZIR": "Sistem hazır. Yürümeye başlayabilirsiniz",
-        "ACIK": "Yol açık, güvenle ilerleyebilirsiniz",
-        "ENGEL_YOK": "Önünüzde engel yok"
+        "HAZIR": "Sistem hazır",
+        "ACIK": "Yol açık",
+        "ENGEL_YOK": "Engel yok"
     }
     
-    # Yeni komutları oluştur (mevcut olmayanları)
+    # Tüm ses dosyalarını yeniden oluştur (kısa ve öz komutlar)
     for key, text in commands.items():
         filepath = os.path.join(AUDIO_DIR, f"{key}.mp3")
-        # Yeni komutlar için veya dosya yoksa oluştur
-        needs_create = not os.path.exists(filepath) or key in ["COK_YAKIN", "ACIK", "HAFIF_SOL", "HAFIF_SAG"]
-        if needs_create:
-            print(f"Ses dosyası oluşturuluyor: {text}")
-            try:
-                tts = gTTS(text=text, lang='tr')
-                tts.save(filepath)
-            except Exception as e:
-                print(f"Ses oluşturma hatası ({key}): {e}")
+        print(f"Ses dosyası oluşturuluyor: {key} -> {text}")
+        try:
+            tts = gTTS(text=text, lang='tr')
+            tts.save(filepath)
+        except Exception as e:
+            print(f"Ses oluşturma hatası ({key}): {e}")
     print("Ses dosyaları hazır!")
 
 def play_sound(command):
@@ -316,7 +543,10 @@ def stabilize_direction(new_direction: str) -> str:
                 if stability_counter >= MIN_STABILITY_COUNT:
                     stable_direction = most_common
                     stability_counter = 0
-                    print(f"[STABİL] Yön değişti: {stable_direction}")
+                    # Debug mesajı sadece MOD 1'de göster
+                    # Debug mesajı sadece Navigasyon modunda (MOD 1)
+                    if mode_manager.current_mode == 1:
+                        print(f"[STABİL] Yön değişti: {stable_direction}")
             else:
                 stability_counter = 0
     
@@ -491,15 +721,104 @@ def draw_regions(frame: np.ndarray, direction: str) -> np.ndarray:
     return frame
 
 
+def run_voice_chat_mode():
+    """
+    MOD 5: Sesli AI Sohbet Modu
+    Kamera kullanmadan, sadece sesli konuşma ile AI sohbeti
+    """
+    print("\n" + "=" * 60)
+    print("    🎙️  SESLİ AI SOHBET MODU")
+    print("=" * 60)
+    
+    # Voice chat servisini başlat
+    if not voice_chat.init():
+        print("❌ Sesli sohbet başlatılamadı!")
+        speak_text_async("Sesli sohbet başlatılamadı. Token veya internet bağlantısını kontrol edin.")
+        return
+    
+    print("\n📌 KOMUTLAR:")
+    print("  - Konuşarak soru sorun")
+    print("  - 'kapat' veya 'çıkış' diyerek çıkın")
+    print("  - Ctrl+C ile acil çıkış")
+    print("-" * 60)
+    
+    # Hoşgeldin mesajı
+    speak_text_async("Merhaba! Size nasıl yardımcı olabilirim?")
+    time.sleep(2)
+    
+    try:
+        while True:
+            print("\n🎤 Dinliyorum... (Konuşabilirsiniz)")
+            
+            # Dinle
+            success, text = voice_chat.listen(timeout=7, phrase_limit=20)
+            
+            if not success:
+                if text is None:
+                    # Timeout - sessizlik
+                    continue
+                elif text == "":
+                    # Anlaşılamadı
+                    speak_text_async("Sizi anlayamadım, tekrar eder misiniz?")
+                    continue
+                else:
+                    # Hata mesajı
+                    print(f"❌ {text}")
+                    continue
+            
+            print(f"👤 Siz: {text}")
+            
+            # Çıkış komutu kontrolü
+            if voice_chat.is_exit_command(text):
+                speak_text_async("Görüşmek üzere, hoşça kalın!")
+                time.sleep(2)
+                break
+            
+            # AI'a sor
+            print("⏳ Düşünüyorum...")
+            answer = voice_chat.ask(text)
+            
+            # Cevabı seslendir
+            print(f"🤖 AI: {answer}")
+            speak_text_async(answer)
+            
+            # Cevap bitmesini bekle
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Kullanıcı tarafından durduruldu.")
+        speak_text_async("Görüşürüz!")
+        time.sleep(1)
+    
+    print("\n✅ Sesli sohbet sonlandırıldı.")
+
+
 def main():
     """
-    Ana fonksiyon - Kamerayı açar, YOLO ile engel tespiti yapar ve yön belirler.
+    Ana fonksiyon - 7 Modlu Görme Engelli Asistanı
+    Mod 1: Navigasyon (varsayılan)
+    Mod 2: Metin Okuma (PaddleOCR)
+    Mod 3: Nesne Tanıma
+    Mod 4: Nesne Arama
+    Mod 5: Sesli AI Sohbet (Mistral)
+    Mod 6: Görsel Soru-Cevap (Gemini)
+    Mod 7: 3D Haritalama (SLAM)
     """
-    global speech_thread_running
+    global speech_thread_running, mode_manager
     
-    print("YOLOv11 Engel Tespit Sistemi Baslatiliyor...")
-    print("Cikmak icin 'q' tusuna basin.")
-    print("-" * 50)
+    print("=" * 60)
+    print("    GÖRME ENGELLİ ASİSTANI - 7 MODLU SİSTEM")
+    print("=" * 60)
+    print("MOD KONTROLLERI:")
+    print("  1 - Navigasyon Modu (yön komutları)")
+    print("  2 - Metin Okuma Modu (OCR)")
+    print("  3 - Nesne Tanıma Modu (çevredeki nesneler)")
+    print("  4 - Nesne Arama Modu")
+    print("  5 - Sesli AI Sohbet Modu (Mistral)")
+    print("  6 - Görsel Soru-Cevap Modu (Gemini)")
+    print("  7 - 3D Haritalama Modu (SLAM)")
+    print("  q - Çıkış")
+    print("-" * 60)
     
     # Ses dosyalarını oluştur
     print("Ses dosyalari hazirlaniyor...")
@@ -513,8 +832,66 @@ def main():
     
     # Test sesi
     speech_queue.put("HAZIR")
-    time.sleep(2)  # Test sesinin bitmesini bekle
+    time.sleep(2)
     print("Ses sistemi hazir!")
+    
+    # === BAŞLANGIÇ MOD SEÇİMİ ===
+    print("\n" + "=" * 60)
+    print("    BAŞLANGIÇ MODU SEÇİN")
+    print("=" * 60)
+    print("  1 - Navigasyon Modu (yön komutları)")
+    print("  2 - Metin Okuma Modu (OCR)")
+    print("  3 - Nesne Tanıma Modu (çevredeki nesneler)")
+    print("  4 - Nesne Arama Modu")
+    print("  5 - Sesli AI Sohbet Modu (Mistral)")
+    print("  6 - Görsel Soru-Cevap Modu (Gemini)")
+    print("  7 - 3D Haritalama Modu (SLAM)")
+    print("-" * 60)
+    
+    while True:
+        try:
+            mod_secimi = input("Mod numarası girin (1-7): ").strip()
+            if mod_secimi in ['1', '2', '3', '4', '5', '6', '7']:
+                mode_manager.switch_mode(int(mod_secimi))
+                break
+            else:
+                print("Geçersiz seçim! 1-7 arası girin.")
+        except:
+            print("Geçersiz giriş!")
+    
+    print(f"\n✅ {mode_manager.get_mode_name()} MODU SEÇİLDİ!")
+    speech_queue.put(f"MOD_{mode_manager.current_mode}")
+    time.sleep(1)
+    
+    # Mod 4 için başlangıçta arama hedefi al
+    search_target = None
+    if mode_manager.current_mode == 4:
+        print("\nAramak istediğiniz nesneyi yazın:")
+        search_target = input("Aranacak nesne: ").strip()
+        if search_target:
+            print(f"🔍 '{search_target}' aranacak...")
+            speak_text_async(f"{search_target} aranıyor")
+    
+    # MOD 5: Sesli AI Sohbet - Ayrı döngüde çalışır (kamera gerektirmez)
+    if mode_manager.current_mode == 5:
+        run_voice_chat_mode()
+        return  # Sohbet bitince program sonlanır
+    
+    # OCR sadece MOD 2'de lazy loading ile yüklenecek
+    # Başlangıçta yükleme yapılmıyor
+    
+    # MOD 7: SLAM başlangıç mesajı
+    if mode_manager.current_mode == 7:
+        print("\n🗺️ 3D HARİTALAMA MODU")
+        print("Kontroller:")
+        print("  SPACE - Haritayı kaydet (maps/ klasörüne)")
+        print("  L     - Harita yükle")
+        print("  R     - Haritayı sıfırla")
+        print("  I     - İstatistikleri göster")
+        slam_mapper.init()
+        print("SLAM sistemi hazır!")
+    
+    print("-" * 60)
     
     # YOLOv11 modelini yükle (VisionPipeline üzerinden)
     print("Vision Pipeline baslatiliyor...")
@@ -527,15 +904,28 @@ def main():
     
     # Kamerayı aç
     print("Kamera aciliyor...")
-    # IP Webcam URL
-    ip_camera_url = "http://10.31.248.109:8080/video"
+    # IP Webcam URL - MJPEG stream formatı
+    ip_camera_url = "http://172.18.160.27:8080/video"
     
-    # Standart VideoCapture yerine LatestFrameReader kullanıyoruz
-    # Bu sınıf arka planda sürekli okuma yaparak gecikmeyi önler
-    cap = LatestFrameReader(ip_camera_url)
+    # Alternatif URL'ler dene
+    urls_to_try = [
+        "http://172.18.160.27:8080/videofeed", 
+        "http://172.18.160.27:8080/?action=stream",
+    ]
     
-    if not cap.isOpened():
-        print(f"HATA: IP Kamera ({ip_camera_url}) acilamadi!")
+    cap = None
+    for url in urls_to_try:
+        print(f"Deneniyor: {url}")
+        test_cap = LatestFrameReader(url)
+        if test_cap.isOpened():
+            cap = test_cap
+            print(f"✓ Bağlantı başarılı: {url}")
+            break
+        else:
+            print(f"✗ Bağlanamadı: {url}")
+    
+    if cap is None or not cap.isOpened():
+        print("HATA: IP Kameraya baglanilamadi!")
         print("Varsayilan kamera (0) deneniyor...")
         cap = LatestFrameReader(0)
         if not cap.isOpened():
@@ -553,16 +943,31 @@ def main():
     # RADAR NAVİGASYON SİSTEMİ
     radar = RadarNavigation(radar_size=400)
     
-    print("Sistem hazir! Engel tespiti ve RADAR basliyor...")
+    print("Sistem hazir! 4 MODLU ASİSTAN başlıyor...")
+    print(f"Aktif Mod: {mode_manager.get_mode_name()}")
     print("-" * 50)
     
     frame_count = 0
-    last_spoken_direction = None  # Son söylenen yön
-    speech_cooldown = 0  # Hemen başla
-    danger_cooldown = 0  # Yakın engel uyarısı için cooldown
-    direction_change_count = 0  # Yön değişikliği sayacı
+    last_spoken_direction = None
+    speech_cooldown = 0
+    danger_cooldown = 0
+    direction_change_count = 0
+    
+    # search_target başlangıçta tanımlandı (mod 4 seçiliyse)
+    search_found = False
+    
+    # Mod zamanlayıcıları
+    last_ocr_time = 0
+    last_describe_time = 0
+    last_search_time = 0
+    
+    # MOD'a göre pencere başlıkları
+    def close_all_windows():
+        cv2.destroyAllWindows()
     
     while True:
+        current_mode = mode_manager.current_mode
+        
         ret, frame = cap.read()
         if not ret or frame is None:
             print("Kare alinamadi! (Yeniden baglaniliyor...)")
@@ -574,6 +979,169 @@ def main():
         
         frame_count += 1
         frame_height, frame_width = frame.shape[:2]
+        
+        # ============================================================
+        # MOD 7: 3D HARİTALAMA (SLAM) - Frame alındıktan hemen sonra
+        # ============================================================
+        if current_mode == 7:
+            # SLAM frame işle
+            success = slam_mapper.process_frame(frame)
+            
+            # SLAM görselleştirmesi al (frame üzerine çizim)
+            slam_vis = slam_mapper.get_visualization(frame)
+            
+            # Kuş bakışı harita al
+            topdown = slam_mapper.get_topdown_map()
+            
+            # İstatistikleri al
+            stats = slam_mapper.get_stats()
+            
+            # Pencereleri göster
+            cv2.imshow("SLAM Kamera", slam_vis)
+            cv2.imshow("SLAM Harita", topdown)
+            
+            # Tuş kontrolü MOD 7 için
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q'):
+                break
+            elif key == ord(' '):  # Haritayı kaydet
+                maps_dir = os.path.join(os.path.dirname(__file__), "maps")
+                os.makedirs(maps_dir, exist_ok=True)
+                filepath = os.path.join(maps_dir, f"room_map_{int(time.time())}.ply")
+                if slam_mapper.save_map(filepath):
+                    print(f"✅ Harita kaydedildi: {filepath}")
+                    speak_text_async("Harita kaydedildi")
+                else:
+                    print("❌ Harita kaydedilemedi (yeterli nokta yok)")
+                    speak_text_async("Harita kaydedilemedi")
+            elif key == ord('l'):  # Harita yükle
+                maps_dir = os.path.join(os.path.dirname(__file__), "maps")
+                if os.path.exists(maps_dir):
+                    ply_files = [f for f in os.listdir(maps_dir) if f.endswith('.ply')]
+                    if ply_files:
+                        latest = sorted(ply_files)[-1]
+                        filepath = os.path.join(maps_dir, latest)
+                        if slam_mapper.load_map(filepath):
+                            print(f"✅ Harita yüklendi: {latest}")
+                            speak_text_async("Harita yüklendi")
+                        else:
+                            print("❌ Harita yüklenemedi")
+                    else:
+                        print("❌ Kayıtlı harita bulunamadı")
+                        speak_text_async("Kayıtlı harita yok")
+            elif key == ord('r'):  # Haritayı sıfırla
+                slam_mapper.reset()
+                print("🔄 SLAM sıfırlandı")
+                speak_text_async("Harita sıfırlandı")
+            elif key == ord('i'):  # İstatistikler
+                print(f"\n📊 SLAM İstatistikleri:")
+                print(f"   Toplam Nokta: {stats.get('mps', 0)}")
+                print(f"   Keyframe: {stats.get('kfs', 0)}")
+                print(f"   Kamera Pozisyonu: {stats.get('pos', (0,0,0))}")
+            elif key >= ord('1') and key <= ord('6'):
+                mode_manager.switch_mode(key - ord('0'))
+                cv2.destroyAllWindows()
+                speech_queue.put(f"MOD_{key - ord('0')}")
+            continue
+        
+        # ============================================================
+        # MOD 2: METİN OKUMA - Manuel tetikleme (Boşluk tuşu)
+        # ============================================================
+        if current_mode == 2:
+            # OCR'ı ilk kullanımda yükle (lazy loading)
+            if not ocr_reader.initialized:
+                print("📖 OCR sistemi yükleniyor (ilk kullanım)...")
+                ocr_reader.init()
+            
+            # Sadece kamera görüntüsü göster
+            display_frame = frame.copy()
+            
+            # MOD bilgisi ekle
+            cv2.rectangle(display_frame, (10, 10), (400, 50), (0, 0, 0), -1)
+            cv2.putText(display_frame, "MOD 2: METIN OKUMA [Bosluk=Oku]", (20, 38),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Son okunan metni göster
+            if hasattr(mode_manager, 'last_ocr_text') and mode_manager.last_ocr_text:
+                # Arka plan
+                cv2.rectangle(display_frame, (10, 60), (630, 120), (0, 100, 0), -1)
+                # Metin (kısa göster)
+                short_text = mode_manager.last_ocr_text[:60] + "..." if len(mode_manager.last_ocr_text) > 60 else mode_manager.last_ocr_text
+                cv2.putText(display_frame, f"Okunan: {short_text}", (20, 95),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Sadece tek pencere göster
+            cv2.imshow("Metin Okuma - MOD 2", display_frame)
+            
+            # Tuş kontrolü
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            
+            # BOŞLUK TUŞU: OCR OKUMA
+            elif key == ord(' '):
+                print("\n" + "="*50)
+                print("🔄 OCR TARAMASI BAŞLIYOR...")
+                print("="*50)
+                
+                # OCR çalıştır
+                text = read_text(frame.copy())
+                
+                if text:
+                    # Aynı metin mi kontrol et (tekrar okumayı engelle)
+                    prev_text = getattr(mode_manager, 'last_ocr_text', '')
+                    
+                    # Metinler çok benziyorsa (ilk 50 karakter aynıysa) tekrar okuma
+                    if prev_text and text[:50] == prev_text[:50]:
+                        print("ℹ️ Aynı metin - tekrar okunmuyor")
+                    else:
+                        mode_manager.last_ocr_text = text
+                        print(f"✅ METIN BULUNDU: {text}")
+                        print("🔊 Seslendiriliyor...")
+                        speak_text_async(text)
+                else:
+                    mode_manager.last_ocr_text = "(Metin bulunamadı)"
+                    print("❌ Metin bulunamadı")
+                    speak_text_async("Metin bulunamadı")
+                
+                print("="*50 + "\n")
+            
+            elif key == ord('1'):
+                mode_manager.switch_mode(1)
+                cv2.destroyAllWindows()
+                speech_queue.put("MOD_1")
+                print(f"\n{'='*40}\n🚶 MOD 1: NAVİGASYON MODU AKTİF\n{'='*40}")
+            elif key == ord('3'):
+                mode_manager.switch_mode(3)
+                cv2.destroyAllWindows()
+                speech_queue.put("MOD_3")
+                print(f"\n{'='*40}\n👁️ MOD 3: NESNE TANIMA MODU AKTİF\n{'='*40}")
+            elif key == ord('4'):
+                mode_manager.switch_mode(4)
+                cv2.destroyAllWindows()
+                speech_queue.put("MOD_4")
+                search_target = input("Aranacak nesne: ").strip()
+                print(f"\n{'='*40}\n🔍 MOD 4: NESNE ARAMA MODU AKTİF\n{'='*40}")
+            elif key == ord('5'):
+                # MOD 5'e geçiş (Sesli Sohbet) - ayrı döngü gerektirir
+                print("⚠️ MOD 5 için programı yeniden başlatın")
+            elif key == ord('6'):
+                mode_manager.switch_mode(6)
+                cv2.destroyAllWindows()
+                speech_queue.put("MOD_6")
+                print(f"\n{'='*40}\n📷 MOD 6: GÖRSEL SORU-CEVAP MODU AKTİF\n{'='*40}")
+            elif key == ord('7'):
+                mode_manager.switch_mode(7)
+                cv2.destroyAllWindows()
+                slam_mapper.init()
+                speech_queue.put("MOD_7")
+                print(f"\n{'='*40}\n🗺️ MOD 7: 3D HARİTALAMA MODU AKTİF\n{'='*40}")
+            continue
+        
+        # ============================================================
+        # MOD 1, 3, 4 için YOLO ve Vision Pipeline çalışır
+        # ============================================================
         
         # Vision Pipeline ile işle
         combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
@@ -588,23 +1156,20 @@ def main():
         for item in pipeline_obstacles:
             x1, y1, x2, y2, class_name, confidence = item
             
-            # Bounding box'ı frame sınırları içinde tut (taşma önleme)
+            # Bounding box'ı frame sınırları içinde tut
             x1 = max(0, min(x1, frame_width - 1))
             y1 = max(0, min(y1, frame_height - 1))
             x2 = max(0, min(x2, frame_width))
             y2 = max(0, min(y2, frame_height))
             
-            # Geçersiz box kontrolü (genişlik/yükseklik 0 veya negatif olmasın)
             if x2 <= x1 or y2 <= y1:
                 continue
             
             obstacles.append((x1, y1, x2, y2))
             
-            # Mesafe tahmini (bbox boyutu ile birlikte)
+            # Mesafe tahmini
             bbox_height = y2 - y1
             distance, dist_category = estimate_distance(y2, frame_height, bbox_height)
-            
-            # Renk belirleme (COK_YAKIN dahil)
             if dist_category in ["YAKIN", "COK_YAKIN"]:
                 box_color = (0, 0, 255)  # Kırmızı
             elif dist_category == "ORTA":
@@ -624,83 +1189,7 @@ def main():
         # En yakın engeli bul
         min_distance, closest_category, closest_bbox = get_closest_obstacle(obstacles, frame_height)
         
-        # Yön hesapla ve STABİLİZE ET (kör kullanıcı için kritik)
-        raw_direction = pipeline.find_best_direction(free_space_mask)
-        direction = stabilize_direction(raw_direction)  # Stabil yön
-        
-        # Cooldown azalt
-        if speech_cooldown > 0:
-            speech_cooldown -= 1
-        if danger_cooldown > 0:
-            danger_cooldown -= 1
-        
-        # --- KÖR KULLANICI İÇİN OPTİMİZE SESLİ UYARI SİSTEMİ ---
-        # UZUN COOLDOWN'LAR - Sakin ve anlaşılır komutlar
-        
-        # Ortada engel var mı kontrol et (DUR için gerekli)
-        orta_engel_var = False
-        if closest_bbox is not None:
-            cx = (closest_bbox[0] + closest_bbox[2]) // 2  # Engel merkezi X
-            left_end = frame_width // 3
-            right_start = 2 * frame_width // 3
-            orta_engel_var = left_end <= cx <= right_start
-        
-        # 1. ACİL DURUM: ÇOK YAKIN + ORTADA (en yüksek öncelik)
-        if closest_category == "COK_YAKIN" and orta_engel_var and danger_cooldown <= 0:
-            while not speech_queue.empty():
-                try: speech_queue.get_nowait()
-                except: pass
-            speech_queue.put("COK_YAKIN")
-            danger_cooldown = 90   # 3 saniye - acil uyarılar arası
-            speech_cooldown = 90
-            print(f"ACİL: Çok yakın engel ORTADA! ({min_distance:.1f}m)")
-        
-        # 2. DUR komutu (sadece ORTADA engel varsa ve tüm yönler kapalıysa)
-        elif raw_direction == "DUR" and orta_engel_var and danger_cooldown <= 0:
-            while not speech_queue.empty():
-                try: speech_queue.get_nowait()
-                except: pass
-            speech_queue.put("DUR")
-            danger_cooldown = 90   # 3 saniye
-            speech_cooldown = 90
-            print("ACİL: DUR komutu - Ortada engel!")
-        
-        # 3. YAKIN ENGEL UYARISI (sadece ORTADA yakın engel varsa)
-        elif closest_category == "YAKIN" and orta_engel_var and min_distance is not None and min_distance < 2.0 and danger_cooldown <= 0:
-            while not speech_queue.empty():
-                try: speech_queue.get_nowait()
-                except: pass
-            speech_queue.put("YAKIN")
-            danger_cooldown = 120  # 4 saniye
-            speech_cooldown = 120
-            print(f"UYARI: Yakın engel ORTADA ({min_distance:.1f}m)")
-        
-        # 4. YÖN DEĞİŞİKLİĞİ (stabilize edilmiş - yavaş değişim)
-        elif direction != last_spoken_direction and speech_cooldown <= 0:
-            while not speech_queue.empty():
-                try: speech_queue.get_nowait()
-                except: pass
-            speech_queue.put(direction)
-            last_spoken_direction = direction
-            speech_cooldown = 150  # 5 saniye - yön değişiklikleri arası
-            print(f"Yön: {direction}")
-        
-        # 5. YOL AÇIK BİLDİRİMİ (engel yokken)
-        elif len(obstacles) == 0 and speech_cooldown <= 0 and last_spoken_direction != "ACIK":
-            speech_queue.put("ACIK")
-            last_spoken_direction = "ACIK"
-            speech_cooldown = 180  # 6 saniye
-            print("Bilgi: Yol açık")
-        
-        # 6. PERİYODİK HATIRLATMA (her 5 saniyede)
-        elif speech_cooldown <= 0 and raw_direction not in ["DUR"] and direction not in ["ACIK"]:
-            while not speech_queue.empty():
-                try: speech_queue.get_nowait()
-                except: pass
-            speech_queue.put(direction)
-            speech_cooldown = 150  # 5 saniye
-        
-        # === RADAR NAVİGASYON SİSTEMİ ===
+        # === RADAR NAVİGASYON SİSTEMİ (YÖN KOMUTU KAYNAĞI) ===
         # YOLO engellerini radar'a aktar (mesafe bilgisi ile)
         radar_obstacles = []
         for item in pipeline_obstacles:
@@ -709,24 +1198,127 @@ def main():
             dist, _ = estimate_distance(y2, frame_height, bbox_height)
             radar_obstacles.append((x1, y1, x2, y2, class_name, dist))
         
-        # Radar'ı güncelle ve görselleştir
+        # Radar'ı güncelle - YÖN KOMUTU RADAR'DAN GELİYOR
         radar_img, radar_direction, radar_info = radar.process_frame(
             radar_obstacles, 
             frame_width, 
             frame_height
         )
         
-        # Eski navigasyon haritası (isteğe bağlı)
-        nav_obstacles = [(x1, y1, x2, y2) for (x1, y1, x2, y2) in obstacles]
-        nav_vis, nav_command, nav_obstacles_info = nav_map.process_frame(
-            nav_obstacles, 
-            free_space_mask, 
-            frame_width, 
-            frame_height
-        )
+        # RADAR YÖN KOMUTUNU ANA YÖN OLARAK KULLAN
+        raw_direction = radar_direction  # Radar yönü ana yön kaynağı
+        direction = stabilize_direction(raw_direction)  # Stabil yön
+        
+        # Cooldown azalt
+        if speech_cooldown > 0:
+            speech_cooldown -= 1
+        if danger_cooldown > 0:
+            danger_cooldown -= 1
+        
+        # === AKILLI GERÇEK ZAMANLI YÖNLENDİRME SİSTEMİ ===
+        # SmartNavigator kullanarak akıcı ve tutarlı komutlar
+        
+        # Ortada engel var mı kontrol et
+        orta_engel_var = False
+        engel_bolge = None  # "SOL", "ORTA", "SAG"
+        if closest_bbox is not None:
+            cx = (closest_bbox[0] + closest_bbox[2]) // 2
+            left_end = frame_width // 3
+            right_start = 2 * frame_width // 3
+            
+            if cx < left_end:
+                engel_bolge = "SOL"
+            elif cx > right_start:
+                engel_bolge = "SAG"
+            else:
+                engel_bolge = "ORTA"
+                orta_engel_var = True
+        
+        # Radar yönünü akıllı navigatöre ekle
+        smart_nav.add_direction(direction)
+        
+        # === KAÇIŞ YÖNÜ HESAPLA ===
+        # Radar'ın önerdiği güvenli yön
+        kacis_yonu = None
+        if direction in ["SOL", "HAFIF_SOL"]:
+            kacis_yonu = "SOL"
+        elif direction in ["SAG", "HAFIF_SAG"]:
+            kacis_yonu = "SAG"
+        elif direction == "DÜZ":
+            kacis_yonu = None  # Düz gidebilir
+        
+        # ACİL DURUMLAR - Kaçış yönü ile birlikte
+        is_emergency = False
+        emergency_command = None
+        
+        # 1. ÇOK YAKIN ENGEL - Kaçış yönü ile
+        if closest_category == "COK_YAKIN" and orta_engel_var:
+            is_emergency = True
+            if kacis_yonu == "SOL":
+                emergency_command = "DUR_SOL"
+            elif kacis_yonu == "SAG":
+                emergency_command = "DUR_SAG"
+            else:
+                emergency_command = "DUR_GERI"
+        
+        # 2. DUR komutu - Kaçış yönü ile
+        elif direction == "DUR":
+            is_emergency = True
+            # Engel neredeyse oradan kaç
+            if engel_bolge == "SOL":
+                emergency_command = "ENGEL_SOL"  # Engel solda, sağa git
+            elif engel_bolge == "SAG":
+                emergency_command = "ENGEL_SAG"  # Engel sağda, sola git
+            else:
+                emergency_command = "DUR_GERI"
+        
+        # 3. YAKIN engel uyarısı - Kaçış yönü ile
+        elif closest_category == "YAKIN" and orta_engel_var and min_distance and min_distance < 2.0:
+            is_emergency = True
+            if kacis_yonu == "SOL":
+                emergency_command = "YAKIN_SOL"
+            elif kacis_yonu == "SAG":
+                emergency_command = "YAKIN_SAG"
+            else:
+                emergency_command = "YAKIN"
+        
+        # Acil durum varsa hemen söyle (kaçış yönü ile) - SADECE NAVİGASYON MODUNDA
+        if is_emergency and danger_cooldown <= 0 and mode_manager.current_mode == 1:
+            while not speech_queue.empty():
+                try: speech_queue.get_nowait()
+                except: pass
+            speech_queue.put(emergency_command)
+            danger_cooldown = 40  # 1.3 saniye - daha hızlı tepki
+            speech_cooldown = 40
+            smart_nav.last_command = emergency_command
+            smart_nav.last_command_time = frame_count
+            print(f"🚨 ACİL: {emergency_command}")
+        
+        # Normal yönlendirme - Akıllı navigator karar verir - SADECE NAVİGASYON MODUNDA
+        elif not is_emergency and mode_manager.current_mode == 1:
+            speak_command = smart_nav.update_state(direction, frame_count)
+            
+            if speak_command and speech_cooldown <= 0:
+                while not speech_queue.empty():
+                    try: speech_queue.get_nowait()
+                    except: pass
+                speech_queue.put(speak_command)
+                last_spoken_direction = speak_command
+                speech_cooldown = 30  # 1 saniye
+                print(f"🎯 YÖN: {speak_command}")
+        
+        # Cooldown azalt
+        if speech_cooldown > 0:
+            speech_cooldown -= 1
         
         # Görselleştirme
         combined_view = draw_regions(combined_view, direction)
+        
+        # MOD BİLGİSİNİ EKRANA EKLE
+        mode_text = f"MOD {mode_manager.current_mode}: {mode_manager.get_mode_name()}"
+        cv2.rectangle(combined_view, (frame_width - 220, 5), (frame_width - 5, 35), (0, 0, 0), -1)
+        cv2.putText(combined_view, mode_text, (frame_width - 215, 27),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
         # Bilgi göster
         if min_distance is not None:
@@ -737,29 +1329,200 @@ def main():
         cv2.putText(combined_view, f"Engel: {len(obstacles)}", (10, frame_height - 20), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # Radar yön bilgisi ana ekrana ekle
-        cv2.putText(combined_view, f"Radar: {radar_direction}", (frame_width - 150, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # === MOD'A GÖRE İŞLEM YAP ===
+        current_mode = mode_manager.current_mode
         
-        # Debug (her 30 karede)
-        if frame_count % 30 == 0:
+        # MOD 1: NAVİGASYON (varsayılan davranış - yukarıda yapıldı)
+        # Zaten yön komutları speech sisteminde işleniyor
+        
+        # MOD 2: METİN OKUMA - YUKARIDAKİ ÖZEL BLOKTA İŞLENİYOR
+        # (continue ile atlanıyor, buraya ulaşmaz)
+        
+        # MOD 3: NESNE TANIMA (services/object_describer.py kullanır)
+        if current_mode == 3:
+            if frame_count - last_describe_time > 90:  # Her 3 saniyede
+                last_describe_time = frame_count
+                description = describe_objects(pipeline_obstacles, frame_width, frame_height)
+                print(f"👁️ {description}")
+                speak_text_async(description)
+        
+        # MOD 4: NESNE ARAMA (services/object_searcher.py kullanır)
+        elif current_mode == 4:
+            if search_target and frame_count - last_search_time > 60:  # Her 2 saniyede
+                last_search_time = frame_count
+                
+                # pipeline_obstacles'a mesafe bilgisi ekle
+                obstacles_with_distance = []
+                for item in pipeline_obstacles:
+                    x1, y1, x2, y2, class_name, confidence = item
+                    bbox_height = y2 - y1
+                    distance, _ = estimate_distance(y2, frame_height, bbox_height)
+                    obstacles_with_distance.append((x1, y1, x2, y2, class_name, confidence, distance))
+                
+                # Artık her zaman sonuç döner (bulunamadı dahil)
+                result = search_object(obstacles_with_distance, search_target, frame_width, frame_height, report_not_found=True)
+                if result:
+                    print(f"🔍 {result}")
+                    speak_text_async(result)
+            
+            # Arama hedefini ekranda göster
+            if search_target:
+                cv2.putText(combined_view, f"Araniyor: {search_target}", (10, 80),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        # MOD 6: GÖRSEL SORU-CEVAP (services/image_qa.py kullanır)
+        elif current_mode == 6:
+            # Modül hazır mı kontrol et (lazy loading)
+            if not image_qa.is_ready():
+                if not image_qa.init():
+                    print("❌ Görsel soru-cevap başlatılamadı!")
+                    speak_text_async("Görsel soru cevap başlatılamadı")
+                    mode_manager.switch_mode(1)  # Navigasyona dön
+                    current_mode = 1
+                else:
+                    speak_text_async("Görsel soru cevap hazır. Sorunuzu sormak için boşluk tuşuna basın.")
+            
+            # Ekranda bilgi göster
+            cv2.putText(combined_view, "GORSEL SORU-CEVAP", (10, 80),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(combined_view, "Bosluk: Soru yaz (terminale)", (10, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Debug (her 30 karede) - SADECE NAVİGASYON MODUNDA
+        if frame_count % 30 == 0 and current_mode == 1:
             dist_str = f"{min_distance:.1f}m" if min_distance else "Yok"
-            print(f"Kare: {frame_count} | Engel: {len(obstacles)} | Radar: {radar_direction} | Stabil: {direction}")
+            print(f"[MOD {current_mode}] Kare: {frame_count} | Engel: {len(obstacles)} | Yon: {direction}")
         
-        # Görüntüleri göster
-        cv2.imshow("Akilli Asistan - Yonlendirme", combined_view)
-        cv2.imshow("Kus Bakisi (BEV)", bev_combined)
-        cv2.imshow("RADAR Navigasyon", radar_img)
+        # ============================================================
+        # MOD'A GÖRE PENCERE GÖSTER
+        # ============================================================
+        if current_mode == 1:
+            # NAVİGASYON: Tüm pencereler
+            cv2.imshow("Navigasyon - MOD 1", combined_view)
+            cv2.imshow("Kus Bakisi (BEV)", bev_combined)
+            cv2.imshow("RADAR Navigasyon", radar_img)
+        elif current_mode == 3:
+            # NESNE TANIMA: Sadece ana görüntü
+            cv2.imshow("Nesne Tanima - MOD 3", combined_view)
+        elif current_mode == 4:
+            # NESNE ARAMA: Sadece ana görüntü
+            cv2.imshow("Nesne Arama - MOD 4", combined_view)
+        elif current_mode == 6:
+            # GÖRSEL SORU-CEVAP: Sadece ana görüntü
+            cv2.imshow("Gorsel Soru-Cevap - MOD 6", combined_view)
+        
+        # TUŞ KONTROLLERI
+        key = cv2.waitKey(1) & 0xFF
         
         # Çıkış
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if key == ord('q'):
             print("\nProgram sonlandiriliyor...")
             break
+        
+        # MOD 6: BOŞLUK TUŞU İLE SORU SOR (YAZILI)
+        elif key == ord(' ') and mode_manager.current_mode == 6:
+            if image_qa.is_ready():
+                print("\n" + "=" * 50)
+                print("📷 Fotoğraf çekiliyor...")
+                
+                # Mevcut frame'i kaydet
+                current_frame = frame.copy()
+                
+                # Kullanıcıdan yazılı soru al
+                print("✏️ Sorunuzu yazın:")
+                question = input("Soru: ").strip()
+                
+                if question:
+                    print(f"❓ Soru: {question}")
+                    print("⏳ Gemini analiz ediyor...")
+                    speak_text_async("Analiz ediyorum, lütfen bekleyin")
+                    
+                    # Gemini'ye gönder
+                    answer = image_qa.process_query(current_frame, question)
+                    
+                    print(f"💬 Yanıt: {answer}")
+                    speak_text_async(answer)
+                else:
+                    print("❌ Soru girilmedi")
+                
+                print("=" * 50 + "\n")
+        
+        # MOD DEĞİŞTİRME
+        elif key == ord('1'):
+            mode_manager.switch_mode(1)
+            cv2.destroyAllWindows()
+            print(f"\n{'='*40}")
+            print(f"🚶 MOD 1: NAVİGASYON MODU AKTİF")
+            print(f"{'='*40}")
+            speech_queue.put("MOD_1")
+        
+        elif key == ord('2'):
+            mode_manager.switch_mode(2)
+            cv2.destroyAllWindows()
+            print(f"\n{'='*40}")
+            print(f"📖 MOD 2: METİN OKUMA MODU AKTİF")
+            print(f"{'='*40}")
+            speech_queue.put("MOD_2")
+        
+        elif key == ord('3'):
+            mode_manager.switch_mode(3)
+            cv2.destroyAllWindows()
+            print(f"\n{'='*40}")
+            print(f"👁️ MOD 3: NESNE TANIMA MODU AKTİF")
+            print(f"{'='*40}")
+            speech_queue.put("MOD_3")
+        
+        elif key == ord('4'):
+            mode_manager.switch_mode(4)
+            print(f"\n{'='*40}")
+            print(f"🔍 MOD 4: NESNE ARAMA MODU AKTİF")
+            print("Aramak istediğiniz nesneyi yazın (örn: insan, sandalye, telefon):")
+            print(f"{'='*40}")
+            speech_queue.put("MOD_4")
+            # Terminalde arama hedefi al
+            search_target = input("Aranacak nesne: ").strip()
+            if search_target:
+                print(f"🔍 '{search_target}' aranıyor...")
+                speak_text_async(f"{search_target} aranıyor")
+                search_found = False
+        
+        # MOD 4'te yeni arama
+        elif key == ord('s') and mode_manager.current_mode == 4:
+            print("Yeni arama hedefi girin:")
+            search_target = input("Aranacak nesne: ").strip()
+            if search_target:
+                print(f"🔍 '{search_target}' aranıyor...")
+                speak_text_async(f"{search_target} aranıyor")
+                search_found = False
+        
+        elif key == ord('6'):
+            mode_manager.switch_mode(6)
+            cv2.destroyAllWindows()
+            print(f"\n{'='*40}")
+            print(f"📷 MOD 6: GÖRSEL SORU-CEVAP MODU AKTİF")
+            print(f"   Boşluk tuşuna basarak soru sorun")
+            print(f"{'='*40}")
+            speech_queue.put("MOD_6")
+        
+        elif key == ord('7'):
+            mode_manager.switch_mode(7)
+            cv2.destroyAllWindows()
+            slam_mapper.init()
+            print(f"\n{'='*40}")
+            print(f"🗺️ MOD 7: 3D HARİTALAMA MODU AKTİF")
+            print(f"   SPACE: Kaydet | L: Yükle | R: Sıfırla")
+            print(f"{'='*40}")
+            speech_queue.put("MOD_7")
     
     # Temizlik
     speech_thread_running = False
     cap.release()
     cv2.destroyAllWindows()
+    
+    # MOD 6 temizliği
+    if image_qa.is_ready():
+        image_qa.cleanup()
+    
     print("Program basariyla sonlandirildi.")
 
 

@@ -21,57 +21,114 @@ from services import voice_chat  # MOD 5: Sesli AI Sohbet
 from services import image_qa  # MOD 6: Görsel Soru-Cevap (Gemini)
 from services import slam_mapper  # MOD 7: 3D Harita (SLAM)
 
-# --- IP KAMERA İÇİN HIZLANDIRICI SINIF ---
-class LatestFrameReader:
+# --- RASPBERRY PI CAMERA MODULE V3 İÇİN PICAMERA2 SINIFI ---
+from picamera2 import Picamera2
+
+class PiCameraReader:
     """
-    IP Kameralardaki gecikmeyi (lag) önlemek için arka planda sürekli okuma yapar
-    ve her zaman en son kareyi verir.
+    Raspberry Pi Camera Module v3 için picamera2 kütüphanesi kullanarak
+    arka planda sürekli kare okur ve her zaman en son kareyi verir.
+    
+    Args:
+        camera_num: Kamera port numarası (0 = CAM0, 1 = CAM1)
+        resolution: Çözünürlük tuple (genişlik, yükseklik)
+        fps: Saniyedeki kare sayısı
     """
-    def __init__(self, src=0):
-        self.cap = cv2.VideoCapture(src)
-        # Buffer boyutunu küçültmeyi dene (Backend destekliyorsa)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
+    def __init__(self, camera_num=0, resolution=(640, 480), fps=30):
         self.lock = threading.Lock()
         self.running = True
         self.latest_frame = None
         self.ret = False
+        self._opened = False
         
-        # İlk kareyi oku
-        self.ret, self.latest_frame = self.cap.read()
-        if not self.ret:
-            print("Hata: Kamera başlatılamadı veya akış yok!")
+        try:
+            # Picamera2 başlat - belirtilen kamera portunu kullan
+            self.picam2 = Picamera2(camera_num=camera_num)
+            print(f"Kamera port {camera_num} seçildi...")
+            
+            # Kamera konfigürasyonu
+            config = self.picam2.create_preview_configuration(
+                main={"size": resolution, "format": "RGB888"},
+                controls={"FrameRate": fps}
+            )
+            self.picam2.configure(config)
+            
+            # Kamerayı başlat
+            self.picam2.start()
+            time.sleep(1)  # Kameranın hazırlanması için bekle
+            
+            # İlk kareyi oku
+            self.latest_frame = self.picam2.capture_array()
+            if self.latest_frame is not None:
+                # RGB -> BGR dönüşümü (OpenCV uyumluluğu için)
+                self.latest_frame = cv2.cvtColor(self.latest_frame, cv2.COLOR_RGB2BGR)
+                self.ret = True
+                self._opened = True
+                print("[OK] Raspberry Pi Camera Module v3 başarıyla başlatıldı!")
+            else:
+                print("Hata: Kameradan kare alınamadı!")
+                self.running = False
+                return
+            
+            # Okuma thread'ini başlat
+            self.thread = threading.Thread(target=self.update, daemon=True)
+            self.thread.start()
+            
+        except Exception as e:
+            print(f"Hata: Pi Camera başlatılamadı - {e}")
             self.running = False
-            return
-
-        # Okuma thread'ini başlat
-        self.thread = threading.Thread(target=self.update, daemon=True)
-        self.thread.start()
+            self._opened = False
 
     def update(self):
+        """Arka planda sürekli kare okur"""
         while self.running:
-            ret, frame = self.cap.read()
-            with self.lock:
-                self.ret = ret
-                self.latest_frame = frame
-            # CPU'yu boğmamak için minik bir uyku (opsiyonel, gerekirse kaldırılabilir)
-            time.sleep(0.001) 
+            try:
+                frame = self.picam2.capture_array()
+                if frame is not None:
+                    # RGB -> BGR dönüşümü
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    with self.lock:
+                        self.ret = True
+                        self.latest_frame = frame
+            except Exception as e:
+                print(f"Kare okuma hatası: {e}")
+                with self.lock:
+                    self.ret = False
+            # CPU'yu boğmamak için minik bir uyku
+            time.sleep(0.001)
 
     def read(self):
+        """En son kareyi döndürür"""
         with self.lock:
-            return self.ret, self.latest_frame
+            if self.latest_frame is not None:
+                return self.ret, self.latest_frame.copy()
+            return False, None
 
     def release(self):
+        """Kamerayı kapat"""
         self.running = False
-        if self.thread.is_alive():
-            self.thread.join()
-        self.cap.release()
+        if hasattr(self, 'thread') and self.thread.is_alive():
+            self.thread.join(timeout=2)
+        if hasattr(self, 'picam2'):
+            try:
+                self.picam2.stop()
+                self.picam2.close()
+            except:
+                pass
+        print("Pi Camera kapatıldı.")
     
     def isOpened(self):
-        return self.cap.isOpened()
+        """Kamera açık mı?"""
+        return self._opened
 
     def set(self, prop, value):
-        self.cap.set(prop, value)
+        """
+        OpenCV uyumluluğu için set metodu.
+        Picamera2'de bu ayarlar konfigürasyonda yapılır.
+        """
+        # Picamera2'de çalışma anında resolution değişikliği desteklenmiyor
+        # Konfigürasyon başlangıçta yapılır
+        pass
 
 # Pygame mixer başlat
 pygame.mixer.init()
@@ -267,9 +324,9 @@ def speak_text_temp(text, lang='tr'):
         if os.path.exists(temp_file):
             os.remove(temp_file)
             
-        print(f"🔊 Seslendirme tamamlandı: {text[:50]}...")
+        print(f"[SES] Seslendirme tamamlandı: {text[:50]}...")
     except Exception as e:
-        print(f"❌ Ses hatası: {e}")
+        print(f"[HATA] Ses hatası: {e}")
         if os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
@@ -727,16 +784,16 @@ def run_voice_chat_mode():
     Kamera kullanmadan, sadece sesli konuşma ile AI sohbeti
     """
     print("\n" + "=" * 60)
-    print("    🎙️  SESLİ AI SOHBET MODU")
+    print("    [MIC]  SESLİ AI SOHBET MODU")
     print("=" * 60)
     
     # Voice chat servisini başlat
     if not voice_chat.init():
-        print("❌ Sesli sohbet başlatılamadı!")
+        print("[HATA] Sesli sohbet başlatılamadı!")
         speak_text_async("Sesli sohbet başlatılamadı. Token veya internet bağlantısını kontrol edin.")
         return
     
-    print("\n📌 KOMUTLAR:")
+    print("\n[PIN] KOMUTLAR:")
     print("  - Konuşarak soru sorun")
     print("  - 'kapat' veya 'çıkış' diyerek çıkın")
     print("  - Ctrl+C ile acil çıkış")
@@ -748,7 +805,7 @@ def run_voice_chat_mode():
     
     try:
         while True:
-            print("\n🎤 Dinliyorum... (Konuşabilirsiniz)")
+            print("\n[MIC] Dinliyorum... (Konuşabilirsiniz)")
             
             # Dinle
             success, text = voice_chat.listen(timeout=7, phrase_limit=20)
@@ -763,10 +820,10 @@ def run_voice_chat_mode():
                     continue
                 else:
                     # Hata mesajı
-                    print(f"❌ {text}")
+                    print(f"[HATA] {text}")
                     continue
             
-            print(f"👤 Siz: {text}")
+            print(f"[KULLANICI] Siz: {text}")
             
             # Çıkış komutu kontrolü
             if voice_chat.is_exit_command(text):
@@ -775,22 +832,22 @@ def run_voice_chat_mode():
                 break
             
             # AI'a sor
-            print("⏳ Düşünüyorum...")
+            print("[BEKLE] Düşünüyorum...")
             answer = voice_chat.ask(text)
             
             # Cevabı seslendir
-            print(f"🤖 AI: {answer}")
+            print(f"[AI] AI: {answer}")
             speak_text_async(answer)
             
             # Cevap bitmesini bekle
             time.sleep(1)
             
     except KeyboardInterrupt:
-        print("\n\n⚠️ Kullanıcı tarafından durduruldu.")
+        print("\n\n[UYARI] Kullanıcı tarafından durduruldu.")
         speak_text_async("Görüşürüz!")
         time.sleep(1)
     
-    print("\n✅ Sesli sohbet sonlandırıldı.")
+    print("\n[OK] Sesli sohbet sonlandırıldı.")
 
 
 def main():
@@ -859,7 +916,7 @@ def main():
         except:
             print("Geçersiz giriş!")
     
-    print(f"\n✅ {mode_manager.get_mode_name()} MODU SEÇİLDİ!")
+    print(f"\n[OK] {mode_manager.get_mode_name()} MODU SEÇİLDİ!")
     speech_queue.put(f"MOD_{mode_manager.current_mode}")
     time.sleep(1)
     
@@ -869,7 +926,7 @@ def main():
         print("\nAramak istediğiniz nesneyi yazın:")
         search_target = input("Aranacak nesne: ").strip()
         if search_target:
-            print(f"🔍 '{search_target}' aranacak...")
+            print(f"[ARA] '{search_target}' aranacak...")
             speak_text_async(f"{search_target} aranıyor")
     
     # MOD 5: Sesli AI Sohbet - Ayrı döngüde çalışır (kamera gerektirmez)
@@ -882,7 +939,7 @@ def main():
     
     # MOD 7: SLAM başlangıç mesajı
     if mode_manager.current_mode == 7:
-        print("\n🗺️ 3D HARİTALAMA MODU")
+        print("\n[HARITA] 3D HARİTALAMA MODU")
         print("Kontroller:")
         print("  SPACE - Haritayı kaydet (maps/ klasörüne)")
         print("  L     - Harita yükle")
@@ -893,48 +950,41 @@ def main():
     
     print("-" * 60)
     
-    # YOLOv11 modelini yükle (VisionPipeline üzerinden)
-    print("Vision Pipeline baslatiliyor...")
+    # ONNX model yükle (32-bit ARM uyumlu)
+    print("Vision Pipeline baslatiliyor (ONNX Runtime)...")
     try:
-        pipeline = VisionPipeline("../models/yolo11n.pt")
+        pipeline = VisionPipeline("../models/yolo11n.onnx")
         print("Pipeline hazir!")
     except Exception as e:
         print(f"Pipeline baslatma hatasi: {e}")
+        print("NOT: ONNX modeli oluşturmak için başka bir bilgisayarda:")
+        print("  from ultralytics import YOLO")
+        print("  model = YOLO('yolo11n.pt')")
+        print("  model.export(format='onnx', imgsz=640)")
         return
     
-    # Kamerayı aç
-    print("Kamera aciliyor...")
-    # IP Webcam URL - MJPEG stream formatı
-    ip_camera_url = "http://172.18.160.27:8080/video"
+    # Raspberry Pi Camera Module v3'ü aç (CAM0 portuna bağlı)
+    print("Raspberry Pi Camera Module v3 başlatılıyor (Port: CAM0)...")
     
-    # Alternatif URL'ler dene
-    urls_to_try = [
-        "http://172.18.160.27:8080/videofeed", 
-        "http://172.18.160.27:8080/?action=stream",
-    ]
-    
-    cap = None
-    for url in urls_to_try:
-        print(f"Deneniyor: {url}")
-        test_cap = LatestFrameReader(url)
-        if test_cap.isOpened():
-            cap = test_cap
-            print(f"✓ Bağlantı başarılı: {url}")
-            break
-        else:
-            print(f"✗ Bağlanamadı: {url}")
-    
-    if cap is None or not cap.isOpened():
-        print("HATA: IP Kameraya baglanilamadi!")
-        print("Varsayilan kamera (0) deneniyor...")
-        cap = LatestFrameReader(0)
+    try:
+        # Pi Camera'yı başlat - CAM0 portu, 640x480 çözünürlük, 30 FPS
+        cap = PiCameraReader(camera_num=0, resolution=(640, 480), fps=30)
+        
         if not cap.isOpened():
-            print("HATA: Hicbir kamera acilamadi!")
+            print("HATA: Raspberry Pi Camera başlatılamadı!")
+            print("Kamera bağlantısını ve ribbon kablosunu kontrol edin.")
+            print("raspi-config ile kamera arayüzünün etkin olduğundan emin olun.")
             return
-    
-    # Kamera ayarları (IP kamerada çalışmayabilir ama yine de kalsın)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        print("[OK] Raspberry Pi Camera Module v3 hazır!")
+        
+    except Exception as e:
+        print(f"HATA: Kamera başlatma hatası - {e}")
+        print("Olası çözümler:")
+        print("  1. 'sudo apt install -y python3-picamera2' komutunu çalıştırın")
+        print("  2. raspi-config'den 'Interface Options > Camera' etkinleştirin")
+        print("  3. Ribbon kablosunu kontrol edin")
+        return
     
     # 3D Navigasyon Haritası
     nav_map = NavigationMap(grid_size=(80, 80), cell_size=0.1)
@@ -1010,10 +1060,10 @@ def main():
                 os.makedirs(maps_dir, exist_ok=True)
                 filepath = os.path.join(maps_dir, f"room_map_{int(time.time())}.ply")
                 if slam_mapper.save_map(filepath):
-                    print(f"✅ Harita kaydedildi: {filepath}")
+                    print(f"[OK] Harita kaydedildi: {filepath}")
                     speak_text_async("Harita kaydedildi")
                 else:
-                    print("❌ Harita kaydedilemedi (yeterli nokta yok)")
+                    print("[HATA] Harita kaydedilemedi (yeterli nokta yok)")
                     speak_text_async("Harita kaydedilemedi")
             elif key == ord('l'):  # Harita yükle
                 maps_dir = os.path.join(os.path.dirname(__file__), "maps")
@@ -1023,19 +1073,19 @@ def main():
                         latest = sorted(ply_files)[-1]
                         filepath = os.path.join(maps_dir, latest)
                         if slam_mapper.load_map(filepath):
-                            print(f"✅ Harita yüklendi: {latest}")
+                            print(f"[OK] Harita yüklendi: {latest}")
                             speak_text_async("Harita yüklendi")
                         else:
-                            print("❌ Harita yüklenemedi")
+                            print("[HATA] Harita yüklenemedi")
                     else:
-                        print("❌ Kayıtlı harita bulunamadı")
+                        print("[HATA] Kayıtlı harita bulunamadı")
                         speak_text_async("Kayıtlı harita yok")
             elif key == ord('r'):  # Haritayı sıfırla
                 slam_mapper.reset()
-                print("🔄 SLAM sıfırlandı")
+                print("[YENILE] SLAM sıfırlandı")
                 speak_text_async("Harita sıfırlandı")
             elif key == ord('i'):  # İstatistikler
-                print(f"\n📊 SLAM İstatistikleri:")
+                print(f"\n[STAT] SLAM İstatistikleri:")
                 print(f"   Toplam Nokta: {stats.get('mps', 0)}")
                 print(f"   Keyframe: {stats.get('kfs', 0)}")
                 print(f"   Kamera Pozisyonu: {stats.get('pos', (0,0,0))}")
@@ -1051,7 +1101,7 @@ def main():
         if current_mode == 2:
             # OCR'ı ilk kullanımda yükle (lazy loading)
             if not ocr_reader.initialized:
-                print("📖 OCR sistemi yükleniyor (ilk kullanım)...")
+                print("[OCR] OCR sistemi yükleniyor (ilk kullanım)...")
                 ocr_reader.init()
             
             # Sadece kamera görüntüsü göster
@@ -1082,7 +1132,7 @@ def main():
             # BOŞLUK TUŞU: OCR OKUMA
             elif key == ord(' '):
                 print("\n" + "="*50)
-                print("🔄 OCR TARAMASI BAŞLIYOR...")
+                print("[YENILE] OCR TARAMASI BAŞLIYOR...")
                 print("="*50)
                 
                 # OCR çalıştır
@@ -1097,12 +1147,12 @@ def main():
                         print("ℹ️ Aynı metin - tekrar okunmuyor")
                     else:
                         mode_manager.last_ocr_text = text
-                        print(f"✅ METIN BULUNDU: {text}")
-                        print("🔊 Seslendiriliyor...")
+                        print(f"[OK] METIN BULUNDU: {text}")
+                        print("[SES] Seslendiriliyor...")
                         speak_text_async(text)
                 else:
                     mode_manager.last_ocr_text = "(Metin bulunamadı)"
-                    print("❌ Metin bulunamadı")
+                    print("[HATA] Metin bulunamadı")
                     speak_text_async("Metin bulunamadı")
                 
                 print("="*50 + "\n")
@@ -1122,10 +1172,10 @@ def main():
                 cv2.destroyAllWindows()
                 speech_queue.put("MOD_4")
                 search_target = input("Aranacak nesne: ").strip()
-                print(f"\n{'='*40}\n🔍 MOD 4: NESNE ARAMA MODU AKTİF\n{'='*40}")
+                print(f"\n{'='*40}\n[ARA] MOD 4: NESNE ARAMA MODU AKTİF\n{'='*40}")
             elif key == ord('5'):
                 # MOD 5'e geçiş (Sesli Sohbet) - ayrı döngü gerektirir
-                print("⚠️ MOD 5 için programı yeniden başlatın")
+                print("[UYARI] MOD 5 için programı yeniden başlatın")
             elif key == ord('6'):
                 mode_manager.switch_mode(6)
                 cv2.destroyAllWindows()
@@ -1136,7 +1186,7 @@ def main():
                 cv2.destroyAllWindows()
                 slam_mapper.init()
                 speech_queue.put("MOD_7")
-                print(f"\n{'='*40}\n🗺️ MOD 7: 3D HARİTALAMA MODU AKTİF\n{'='*40}")
+                print(f"\n{'='*40}\n[HARITA] MOD 7: 3D HARİTALAMA MODU AKTİF\n{'='*40}")
             continue
         
         # ============================================================
@@ -1362,7 +1412,7 @@ def main():
                 # Artık her zaman sonuç döner (bulunamadı dahil)
                 result = search_object(obstacles_with_distance, search_target, frame_width, frame_height, report_not_found=True)
                 if result:
-                    print(f"🔍 {result}")
+                    print(f"[ARA] {result}")
                     speak_text_async(result)
             
             # Arama hedefini ekranda göster
@@ -1375,7 +1425,7 @@ def main():
             # Modül hazır mı kontrol et (lazy loading)
             if not image_qa.is_ready():
                 if not image_qa.init():
-                    print("❌ Görsel soru-cevap başlatılamadı!")
+                    print("[HATA] Görsel soru-cevap başlatılamadı!")
                     speak_text_async("Görsel soru cevap başlatılamadı")
                     mode_manager.switch_mode(1)  # Navigasyona dön
                     current_mode = 1
@@ -1434,7 +1484,7 @@ def main():
                 
                 if question:
                     print(f"❓ Soru: {question}")
-                    print("⏳ Gemini analiz ediyor...")
+                    print("[BEKLE] Gemini analiz ediyor...")
                     speak_text_async("Analiz ediyorum, lütfen bekleyin")
                     
                     # Gemini'ye gönder
@@ -1443,7 +1493,7 @@ def main():
                     print(f"💬 Yanıt: {answer}")
                     speak_text_async(answer)
                 else:
-                    print("❌ Soru girilmedi")
+                    print("[HATA] Soru girilmedi")
                 
                 print("=" * 50 + "\n")
         
@@ -1460,7 +1510,7 @@ def main():
             mode_manager.switch_mode(2)
             cv2.destroyAllWindows()
             print(f"\n{'='*40}")
-            print(f"📖 MOD 2: METİN OKUMA MODU AKTİF")
+            print(f"[OCR] MOD 2: METİN OKUMA MODU AKTİF")
             print(f"{'='*40}")
             speech_queue.put("MOD_2")
         
@@ -1475,14 +1525,14 @@ def main():
         elif key == ord('4'):
             mode_manager.switch_mode(4)
             print(f"\n{'='*40}")
-            print(f"🔍 MOD 4: NESNE ARAMA MODU AKTİF")
+            print(f"[ARA] MOD 4: NESNE ARAMA MODU AKTİF")
             print("Aramak istediğiniz nesneyi yazın (örn: insan, sandalye, telefon):")
             print(f"{'='*40}")
             speech_queue.put("MOD_4")
             # Terminalde arama hedefi al
             search_target = input("Aranacak nesne: ").strip()
             if search_target:
-                print(f"🔍 '{search_target}' aranıyor...")
+                print(f"[ARA] '{search_target}' aranıyor...")
                 speak_text_async(f"{search_target} aranıyor")
                 search_found = False
         
@@ -1491,7 +1541,7 @@ def main():
             print("Yeni arama hedefi girin:")
             search_target = input("Aranacak nesne: ").strip()
             if search_target:
-                print(f"🔍 '{search_target}' aranıyor...")
+                print(f"[ARA] '{search_target}' aranıyor...")
                 speak_text_async(f"{search_target} aranıyor")
                 search_found = False
         
@@ -1509,7 +1559,7 @@ def main():
             cv2.destroyAllWindows()
             slam_mapper.init()
             print(f"\n{'='*40}")
-            print(f"🗺️ MOD 7: 3D HARİTALAMA MODU AKTİF")
+            print(f"[HARITA] MOD 7: 3D HARİTALAMA MODU AKTİF")
             print(f"   SPACE: Kaydet | L: Yükle | R: Sıfırla")
             print(f"{'='*40}")
             speech_queue.put("MOD_7")

@@ -62,12 +62,12 @@ class VoiceChatService:
         if self.model_ready:
             return True
         
-        print("🤖 Sesli AI Sohbet başlatılıyor...")
+        print("[AI] Sesli AI Sohbet başlatılıyor...")
         
         # Token kontrolü
         self.hf_token = os.getenv("HUGGINGFACE_TOKEN", "")
         if not self.hf_token:
-            print("❌ HUGGINGFACE_TOKEN bulunamadı!")
+            print("[HATA] HUGGINGFACE_TOKEN bulunamadı!")
             print("   .env dosyasına ekleyin: HUGGINGFACE_TOKEN=hf_xxxxx")
             return False
         
@@ -90,13 +90,13 @@ class VoiceChatService:
             with self.microphone as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
             
-            print("✓ Mikrofon hazır")
+            print("[OK] Mikrofon hazır")
         except Exception as e:
-            print(f"❌ Mikrofon hatası: {e}")
+            print(f"[HATA] Mikrofon hatası: {e}")
             return False
         
         self.model_ready = True
-        print("✓ Sesli AI Sohbet hazır!")
+        print("[OK] Sesli AI Sohbet hazır!")
         return True
     
     def _test_connection(self):
@@ -110,17 +110,17 @@ class VoiceChatService:
             response = requests.post(API_URL, headers=self.headers, json=test_payload, timeout=10)
             
             if response.status_code == 200:
-                print("✓ Hugging Face Mistral bağlandı")
+                print("[OK] Hugging Face Mistral bağlandı")
                 return True
             else:
-                print(f"❌ API Hatası: {response.status_code}")
+                print(f"[HATA] API Hatası: {response.status_code}")
                 print(f"   {response.text[:100]}")
                 return False
         except requests.Timeout:
-            print("❌ API zaman aşımı")
+            print("[HATA] API zaman aşımı")
             return False
         except Exception as e:
-            print(f"❌ Bağlantı hatası: {e}")
+            print(f"[HATA] Bağlantı hatası: {e}")
             return False
     
     def listen(self, timeout=5, phrase_limit=15):

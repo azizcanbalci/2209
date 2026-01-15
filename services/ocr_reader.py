@@ -1,6 +1,7 @@
 """
-MOD 2: PaddleOCR tabanlı Metin Okuma Servisi
-Türkçe için optimize edilmiş
+MOD 2: Tesseract OCR tabanlı Metin Okuma Servisi
+Raspberry Pi 5 (32-bit) için optimize edilmiş
+Türkçe OCR desteği
 """
 import cv2
 import os
@@ -8,8 +9,13 @@ import threading
 import re
 import numpy as np
 
-# Log mesajlarını kapat
-os.environ["PADDLEOCR_LOG_LEVEL"] = "ERROR"
+# Tesseract OCR
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    print("[UYARI] pytesseract yuklu degil! pip install pytesseract")
 
 # =============================================
 # TÜRKÇE KARAKTER DÜZELTMELERİ
@@ -21,7 +27,6 @@ TURKISH_CHAR_MAP = {
     'ð': 'ğ', 'Ð': 'Ğ',
     'â': 'a', 'î': 'i', 'û': 'u',
     '|': 'I',
-    # NOT: '0' ve '1' dönüşümü kaldırıldı - sayıları bozuyordu
     '@': 'a', '$': 's',
     '€': 'e', '£': 'L',
 }
@@ -273,7 +278,6 @@ def fix_turkish_text(text):
             continue
         
         # Sayı + birim kombinasyonları (örn: 5kg, 100m, 50TL) - koru
-        # Ama OCR hatalı kelimeler (c1k1s, g1r1s) düzeltilsin
         word_lower = clean_word.lower()
         
         # Önce direkt düzeltme tablosuna bak (OCR hataları için)
@@ -330,7 +334,12 @@ def clean_ocr_output(text):
     
     return ' '.join(words)
 
+
 class OCRReader:
+    """
+    Tesseract OCR ile metin okuma.
+    32-bit Raspberry Pi için optimize edilmiş.
+    """
     _instance = None
     _lock = threading.Lock()
     
@@ -345,13 +354,12 @@ class OCRReader:
     
     def _init_vars(self):
         """Instance değişkenlerini başlat"""
-        self.ocr = None
         self.initialized = False
-        self.use_new_api = False
+        self.lang = 'tur+eng'  # Türkçe + İngilizce
         self._init_lock = threading.Lock()
         
     def init(self):
-        """Lazy loading - ilk kullanımda yükle (thread-safe)"""
+        """Lazy loading - ilk kullanımda kontrol et (thread-safe)"""
         if self.initialized:
             return True
             
@@ -359,29 +367,34 @@ class OCRReader:
             if self.initialized:
                 return True
                 
+            if not TESSERACT_AVAILABLE:
+                print("[HATA] pytesseract yuklu degil!")
+                return False
+                
             try:
-                from paddleocr import PaddleOCR
-                import logging
-                logging.getLogger('ppocr').setLevel(logging.ERROR)
-                logging.getLogger('paddle').setLevel(logging.ERROR)
+                # Tesseract'ın yüklü olup olmadığını kontrol et
+                version = pytesseract.get_tesseract_version()
+                print(f"[OK] Tesseract OCR v{version} hazir")
                 
-                # PaddleOCR başlat - minimal parametreler
+                # Türkçe dil paketi kontrolü
                 try:
-                    self.ocr = PaddleOCR(lang='tr')
+                    langs = pytesseract.get_languages()
+                    if 'tur' in langs:
+                        self.lang = 'tur+eng'
+                        print("[OK] Turkce dil paketi mevcut")
+                    else:
+                        self.lang = 'eng'
+                        print("[UYARI] Turkce dil paketi yok, Ingilizce kullanilacak")
+                        print("   Yüklemek için: sudo apt install tesseract-ocr-tur")
                 except:
-                    self.ocr = PaddleOCR(lang='en')  # Türkçe yoksa İngilizce
-                    
-                self.initialized = True
-                self.use_new_api = hasattr(self.ocr, 'predict')
+                    self.lang = 'eng'
                 
-                print("✅ PaddleOCR yüklendi")
+                self.initialized = True
                 return True
                 
-            except ImportError:
-                print("❌ PaddleOCR yüklü değil! pip install paddlepaddle paddleocr")
-                return False
             except Exception as e:
-                print(f"❌ PaddleOCR hatası: {e}")
+                print(f"[HATA] Tesseract hatasi: {e}")
+                print("   Yüklemek için: sudo apt install tesseract-ocr tesseract-ocr-tur")
                 return False
 
     def preprocess(self, frame):
@@ -398,7 +411,7 @@ class OCRReader:
         # Gürültü azaltma
         gray = cv2.bilateralFilter(gray, 9, 75, 75)
         
-        # Kontrast artır (CLAHE) - Türkçe karakterler için daha agresif
+        # Kontrast artır (CLAHE)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         
@@ -409,12 +422,10 @@ class OCRReader:
         # Parlaklık ve kontrast ayarı
         gray = cv2.convertScaleAbs(gray, alpha=1.2, beta=10)
         
-        # Adaptif eşikleme (opsiyonel - metin daha belirgin)
-        # gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        #                              cv2.THRESH_BINARY, 11, 2)
+        # Otsu's thresholding (daha iyi sonuç verir)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
-        # BGR'ye geri çevir (PaddleOCR BGR bekliyor)
-        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        return binary
 
     def read(self, frame, use_preprocess=True):
         """
@@ -431,119 +442,79 @@ class OCRReader:
             # İşlenmiş veya orijinal görüntü
             img = self.preprocess(frame) if use_preprocess else frame
             
-            texts = []
+            # Tesseract konfigürasyonu
+            # PSM 3: Fully automatic page segmentation
+            # PSM 6: Assume a single uniform block of text
+            # PSM 11: Sparse text. Find as much text as possible
+            custom_config = r'--oem 3 --psm 6'
             
-            # Yeni API (predict) dene - parametresiz
-            if self.use_new_api:
-                try:
-                    result = self.ocr.predict(img)
-                    texts = self._parse_predict_result(result)
-                except Exception as e:
-                    print(f"predict API hatası: {e}")
-                    self.use_new_api = False
+            # OCR çalıştır
+            text = pytesseract.image_to_string(
+                img, 
+                lang=self.lang,
+                config=custom_config
+            )
             
-            # Eski API (ocr) kullan - parametresiz
-            if not self.use_new_api:
-                try:
-                    result = self.ocr.ocr(img)  # cls parametresi KALDIRILDI
-                    texts = self._parse_ocr_result(result)
-                except Exception as e:
-                    # Son çare: sadece predict
-                    print(f"ocr API hatası: {e}")
-                    try:
-                        result = self.ocr.predict(img)
-                        texts = self._parse_predict_result(result)
-                    except:
-                        pass
-            
-            if texts:
-                final_text = " ".join(texts)
+            if text and text.strip():
                 # Temizle ve Türkçe düzeltmeleri uygula
-                final_text = clean_ocr_output(final_text)
+                final_text = clean_ocr_output(text)
                 final_text = fix_turkish_text(final_text)
                 
                 if final_text and len(final_text.strip()) > 0:
-                    print(f"📖 OCR Sonuç: {final_text}")
+                    print(f"[OCR] Sonuc: {final_text}")
                     return final_text
+            
             return None
             
         except Exception as e:
             print(f"OCR hatası: {e}")
             return None
 
-    def _parse_predict_result(self, result):
-        """Yeni predict API sonucunu işle"""
-        texts = []
-        if not result:
-            return texts
+    def read_with_boxes(self, frame, use_preprocess=True):
+        """
+        OCR ile metin oku ve kutuplama bilgisi döndür
+        Returns: [(text, x, y, w, h, conf), ...]
+        """
+        if not self.initialized:
+            if not self.init():
+                return []
+        
+        try:
+            img = self.preprocess(frame) if use_preprocess else frame
             
-        for item in result:
-            if isinstance(item, dict):
-                # Yeni format: {'rec_texts': [...], 'rec_scores': [...]}
-                rec_texts = item.get('rec_texts', [])
-                rec_scores = item.get('rec_scores', [])
+            # Detaylı OCR verisi al
+            data = pytesseract.image_to_data(
+                img, 
+                lang=self.lang,
+                output_type=pytesseract.Output.DICT
+            )
+            
+            results = []
+            n_boxes = len(data['text'])
+            
+            for i in range(n_boxes):
+                text = data['text'][i].strip()
+                conf = int(data['conf'][i])
                 
-                for i, text in enumerate(rec_texts):
-                    text = text.strip()
-                    conf = rec_scores[i] if i < len(rec_scores) else 0.5
-                    
-                    if self._is_valid_text(text, conf):
-                        texts.append(text)
-                        print(f"  📝 '{text}' (%{conf*100:.0f})")
-                        
-            elif isinstance(item, (list, tuple)):
-                # Alternatif format
-                for line in item:
-                    if isinstance(line, (list, tuple)) and len(line) >= 2:
-                        text_info = line[1] if len(line) > 1 else line[0]
-                        if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
-                            text = str(text_info[0]).strip()
-                            conf = float(text_info[1]) if len(text_info) > 1 else 0.5
-                            if self._is_valid_text(text, conf):
-                                texts.append(text)
-                                print(f"  📝 '{text}' (%{conf*100:.0f})")
-        return texts
-
-    def _parse_ocr_result(self, result):
-        """Eski ocr API sonucunu işle"""
-        texts = []
-        if not result:
-            return texts
-            
-        # result formatı: [[[[x1,y1],[x2,y2],[x3,y3],[x4,y4]], ('text', confidence)], ...]
-        for page in result:
-            if not page:
-                continue
-            for line in page:
-                if not line or len(line) < 2:
+                # Düşük güvenilirlik veya boş metin atla
+                if conf < 30 or not text:
                     continue
-                    
-                text_info = line[1]
-                if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
-                    text = str(text_info[0]).strip()
-                    conf = float(text_info[1])
-                    
-                    if self._is_valid_text(text, conf):
-                        texts.append(text)
-                        print(f"  📝 '{text}' (%{conf*100:.0f})")
-                        
-        return texts
-
-    def _is_valid_text(self, text, confidence):
-        """Metnin geçerli olup olmadığını kontrol et - Türkçe için optimize"""
-        # Boş veya çok kısa
-        if not text or len(text) < 1:
-            return False
-        
-        # Düşük güvenilirlik - Türkçe için daha toleranslı
-        if confidence < 0.2:
-            return False
-        
-        # Sadece sembol
-        if all(c in '!@#$%^&*()_+-=[]{}|;:,.<>?/~`' for c in text):
-            return False
+                
+                x = data['left'][i]
+                y = data['top'][i]
+                w = data['width'][i]
+                h = data['height'][i]
+                
+                # Türkçe düzeltmeleri uygula
+                text = fix_turkish_text(text)
+                
+                results.append((text, x, y, w, h, conf))
             
-        return True
+            return results
+            
+        except Exception as e:
+            print(f"OCR hatası: {e}")
+            return []
 
 
 # Singleton instance
@@ -557,15 +528,15 @@ def read_text(frame):
 
 # Test
 if __name__ == '__main__':
-    print("PaddleOCR Test")
+    print("Tesseract OCR Test")
     print("=" * 40)
     
     # Kamera testi
     cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
-        print("Kamera açılamadı, IP kamera deneniyor...")
-        cap = cv2.VideoCapture("http://172.18.160.61:8080/video")
+        print("Kamera açılamadı!")
+        exit()
     
     print("Kameradan görüntü alınıyor...")
     ret, frame = cap.read()

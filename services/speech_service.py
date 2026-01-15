@@ -27,10 +27,10 @@ def init_speech():
         if not os.path.exists(audio_cache_dir):
             os.makedirs(audio_cache_dir)
         
-        print("✅ Ses sistemi başlatıldı")
+        print("[OK] Ses sistemi baslatildi")
         return True
     except Exception as e:
-        print(f"❌ Ses sistemi hatası: {e}")
+        print(f"[HATA] Ses sistemi hatasi: {e}")
         return False
 
 
@@ -143,7 +143,7 @@ NAVIGATION_COMMANDS = {
 
 def precache_navigation_sounds():
     """Navigasyon seslerini önceden oluştur"""
-    print("🔊 Navigasyon sesleri yükleniyor...")
+    print("Navigasyon sesleri yukleniyor...")
     
     for command, text in NAVIGATION_COMMANDS.items():
         cache_path = get_cached_audio_path(command)
@@ -155,7 +155,7 @@ def precache_navigation_sounds():
             except:
                 pass
     
-    print("✅ Navigasyon sesleri hazır")
+    print("[OK] Navigasyon sesleri hazir")
 
 
 def speak_navigation_command(command):

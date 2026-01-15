@@ -30,7 +30,7 @@ class MapPoint:
 
 class VisualSLAM:
     def __init__(self, camera_matrix=None):
-        print("🗺️ Stable Visual SLAM starting...")
+        print("Stable Visual SLAM starting...")
         
         # Camera intrinsics (typical webcam)
         if camera_matrix is None:
@@ -90,7 +90,7 @@ class VisualSLAM:
         self.kf_frames = 25
         
         self._lock = threading.Lock()
-        print("✓ SLAM ready!")
+        print("[OK] SLAM ready!")
     
     def process_frame(self, frame):
         """Process a new frame"""
@@ -139,7 +139,7 @@ class VisualSLAM:
         self.last_kf_frame = self.frame_id
         
         self.state = "OK"
-        print(f"✓ Initialized with {len(pts)} features")
+        print(f"[OK] Initialized with {len(pts)} features")
         return True
     
     def _track(self, gray):
@@ -453,7 +453,7 @@ class VisualSLAM:
             self.last_kf_pos = np.zeros(3)
             self.last_kf_frame = 0
             MapPoint._counter = 0
-        print("🔄 SLAM reset")
+        print("SLAM reset")
     
     def save_map(self, path):
         """Save map to PLY file"""

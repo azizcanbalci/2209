@@ -62,12 +62,12 @@ class ImageQAService:
         if self.model_ready:
             return True
         
-        print("📷 Görsel Soru-Cevap başlatılıyor...")
+        print("Gorsel Soru-Cevap baslatiliyor...")
         
         # API Key kontrolü
         self.api_key = os.getenv("GEMINI_API_KEY", "")
         if not self.api_key:
-            print("❌ GEMINI_API_KEY bulunamadı!")
+            print("[HATA] GEMINI_API_KEY bulunamadi!")
             print("   .env dosyasına ekleyin: GEMINI_API_KEY=your_api_key")
             return False
         
@@ -76,13 +76,13 @@ class ImageQAService:
             import google.generativeai as genai
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel(MODEL_NAME)
-            print(f"✓ Gemini {MODEL_NAME} bağlandı")
+            print(f"[OK] Gemini {MODEL_NAME} baglandi")
         except ImportError:
-            print("❌ google-generativeai kütüphanesi yüklü değil!")
+            print("[HATA] google-generativeai kutuphanesi yuklu degil!")
             print("   pip install google-generativeai")
             return False
         except Exception as e:
-            print(f"❌ Gemini bağlantı hatası: {e}")
+            print(f"[HATA] Gemini baglanti hatasi: {e}")
             return False
         
         # Speech Recognition başlat
@@ -95,13 +95,13 @@ class ImageQAService:
             with self.microphone as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
             
-            print("✓ Mikrofon hazır")
+            print("[OK] Mikrofon hazir")
         except Exception as e:
-            print(f"❌ Mikrofon hatası: {e}")
+            print(f"[HATA] Mikrofon hatasi: {e}")
             return False
         
         self.model_ready = True
-        print("✓ Görsel Soru-Cevap hazır!")
+        print("[OK] Gorsel Soru-Cevap hazir!")
         return True
     
     def capture_frame(self, frame):
@@ -127,11 +127,11 @@ class ImageQAService:
             # Silinecek listeye ekle
             self.temp_files.append(temp_path)
             
-            print(f"📸 Fotoğraf kaydedildi: {temp_path}")
+            print(f"[FOTO] Fotograf kaydedildi: {temp_path}")
             return temp_path
             
         except Exception as e:
-            print(f"❌ Fotoğraf kaydetme hatası: {e}")
+            print(f"[HATA] Fotograf kaydetme hatasi: {e}")
             return None
     
     def listen_question(self, timeout=7, phrase_limit=15):
@@ -207,7 +207,7 @@ Lütfen resmi analiz ederek bu soruyu Türkçe yanıtla."""
                 
         except Exception as e:
             error_str = str(e)
-            print(f"❌ Gemini hatası: {e}")
+            print(f"[HATA] Gemini hatasi: {e}")
             
             # Kota hatası kontrolü
             if "429" in error_str or "quota" in error_str.lower():
@@ -225,9 +225,9 @@ Lütfen resmi analiz ederek bu soruyu Türkçe yanıtla."""
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
-                    print(f"🗑️ Silindi: {file_path}")
+                    print(f"[SILINDI] {file_path}")
             except Exception as e:
-                print(f"⚠️ Dosya silinemedi: {file_path} - {e}")
+                print(f"[UYARI] Dosya silinemedi: {file_path} - {e}")
         
         self.temp_files = []
     

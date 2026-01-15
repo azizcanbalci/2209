@@ -374,14 +374,14 @@ class OCRReader:
                 self.initialized = True
                 self.use_new_api = hasattr(self.ocr, 'predict')
                 
-                print("✅ PaddleOCR yüklendi")
+                print("[OK] PaddleOCR yuklendi")
                 return True
                 
             except ImportError:
-                print("❌ PaddleOCR yüklü değil! pip install paddlepaddle paddleocr")
+                print("[HATA] PaddleOCR yuklu degil! pip install paddlepaddle paddleocr")
                 return False
             except Exception as e:
-                print(f"❌ PaddleOCR hatası: {e}")
+                print(f"[HATA] PaddleOCR hatasi: {e}")
                 return False
 
     def preprocess(self, frame):
@@ -463,7 +463,7 @@ class OCRReader:
                 final_text = fix_turkish_text(final_text)
                 
                 if final_text and len(final_text.strip()) > 0:
-                    print(f"📖 OCR Sonuç: {final_text}")
+                    print(f"[OCR] Sonuc: {final_text}")
                     return final_text
             return None
             
@@ -489,7 +489,7 @@ class OCRReader:
                     
                     if self._is_valid_text(text, conf):
                         texts.append(text)
-                        print(f"  📝 '{text}' (%{conf*100:.0f})")
+                        print(f"  [TEXT] '{text}' (%{conf*100:.0f})")
                         
             elif isinstance(item, (list, tuple)):
                 # Alternatif format
@@ -501,7 +501,7 @@ class OCRReader:
                             conf = float(text_info[1]) if len(text_info) > 1 else 0.5
                             if self._is_valid_text(text, conf):
                                 texts.append(text)
-                                print(f"  📝 '{text}' (%{conf*100:.0f})")
+                                print(f"  [TEXT] '{text}' (%{conf*100:.0f})")
         return texts
 
     def _parse_ocr_result(self, result):
@@ -525,7 +525,7 @@ class OCRReader:
                     
                     if self._is_valid_text(text, conf):
                         texts.append(text)
-                        print(f"  📝 '{text}' (%{conf*100:.0f})")
+                        print(f"  [TEXT] '{text}' (%{conf*100:.0f})")
                         
         return texts
 

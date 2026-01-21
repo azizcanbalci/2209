@@ -49,8 +49,8 @@ class RadarNavigation:
         # Güvenli yol noktaları
         self.safe_path = []
         
-        # Yön geçmişi (stabilizasyon için)
-        self.direction_history = deque(maxlen=10)
+        # Yön geçmişi (stabilizasyon için) - HIZLI VERSiYON
+        self.direction_history = deque(maxlen=5)  # Azaltıldı: 10 -> 5
         self.stable_direction = "DÜZ"
         
         # Renk paleti
@@ -180,8 +180,9 @@ class RadarNavigation:
     
     def calculate_safe_direction(self):
         """
-        SAFE PATH KIVIRIMLARINI TAKİP EDEN YÖN HESAPLAMA
+        SAFE PATH KIVIRIMLARINI TAKİP EDEN YÖN HESAPLAMA - KESİN VERSİYON
         Radar'daki sarı yolu kıvrımlarıyla birlikte takip eder.
+        Daha düşük eşiklerle daha hızlı karar verir.
         
         Returns:
             str: "DÜZ", "SOL", "SAG", "HAFIF_SOL", "HAFIF_SAG", "DUR"
@@ -194,14 +195,21 @@ class RadarNavigation:
         orta_dist = self.closest_obstacles['ORTA']['distance'] if self.closest_obstacles['ORTA'] else 10
         sag_dist = self.closest_obstacles['SAG']['distance'] if self.closest_obstacles['SAG'] else 10
         
-        # ACİL DURUM: Ortada çok yakın engel (1m içinde)
-        if orta_dist < 1.0:
-            if sol_dist > sag_dist and sol_dist > 1.5:
+        # ACİL DURUM: Ortada çok yakın engel (1.2m içinde) - biraz artırıldı
+        if orta_dist < 1.2:
+            if sol_dist > sag_dist and sol_dist > 1.2:
                 return "SOL"
-            elif sag_dist > 1.5:
+            elif sag_dist > 1.2:
                 return "SAG"
             else:
                 return "DUR"
+        
+        # ORTA MESAFE ENGELİ: 1.2-2.5m arası - yönlendirme başlasın
+        if orta_dist < 2.5:
+            if sol_dist > sag_dist and sol_dist > orta_dist * 1.3:
+                return "HAFIF_SOL"
+            elif sag_dist > orta_dist * 1.3:
+                return "HAFIF_SAG"
         
         # SAFE PATH KIVIRIMLARINI ANALİZ ET
         if len(self.safe_path) >= 3:
@@ -213,38 +221,37 @@ class RadarNavigation:
                 
                 # Kıvrım çok yakınsa (1.5m içinde) - hemen dön
                 if turn_dist < 1.5:
-                    if turn_intensity > 0.6:  # Keskin kıvrım
+                    if turn_intensity > 0.5:  # Düşürüldü: 0.6 -> 0.5
                         return turn_dir
-                    else:  # Hafif kıvrım
+                    else:
                         return f"HAFIF_{turn_dir}"
                 
                 # Kıvrım biraz ileride (1.5-3m) - hafif dönmeye başla
-                elif turn_dist < 3.0 and turn_intensity > 0.5:
+                elif turn_dist < 3.0 and turn_intensity > 0.4:  # Düşürüldü: 0.5 -> 0.4
                     return f"HAFIF_{turn_dir}"
             
-            # Kıvrım yoksa veya uzakta - mevcut yol yönünü takip et
-            # İlk birkaç noktanın ortalama yönünü hesapla
-            path_points = self.safe_path[:min(5, len(self.safe_path))]
+            # Kıvrım yoksa - mevcut yol yönünü takip et
+            path_points = self.safe_path[:min(4, len(self.safe_path))]  # Azaltıldı: 5 -> 4
             
             # Ağırlıklı X kayması hesapla
             total_x_shift = 0
             total_weight = 0
             for i, (px, py) in enumerate(path_points):
                 x_diff = px - self.user_x
-                weight = 1.0 + (len(path_points) - i) * 0.5  # Yakın noktalar daha önemli
+                weight = 1.0 + (len(path_points) - i) * 0.7  # Artırıldı: 0.5 -> 0.7
                 total_x_shift += x_diff * weight
                 total_weight += weight
             
             avg_x_shift = total_x_shift / total_weight if total_weight > 0 else 0
             
-            # X kaymasına göre yön belirle
-            if avg_x_shift < -25:  # Güçlü sola
+            # X kaymasına göre yön belirle - eşikler düşürüldü
+            if avg_x_shift < -20:  # Düşürüldü: -25 -> -20
                 return "SOL"
-            elif avg_x_shift < -8:  # Hafif sola
+            elif avg_x_shift < -6:  # Düşürüldü: -8 -> -6
                 return "HAFIF_SOL"
-            elif avg_x_shift > 25:  # Güçlü sağa
+            elif avg_x_shift > 20:  # Düşürüldü: 25 -> 20
                 return "SAG"
-            elif avg_x_shift > 8:  # Hafif sağa
+            elif avg_x_shift > 6:  # Düşürüldü: 8 -> 6
                 return "HAFIF_SAG"
             else:
                 return "DÜZ"
@@ -273,19 +280,25 @@ class RadarNavigation:
     def get_stable_direction(self):
         """
         Stabilize edilmiş yön komutu.
-        Hızlı değişimleri önler.
+        HIZLI VERSİYON - Daha kısa geçmiş, daha hızlı tepki.
         """
         raw_direction = self.calculate_safe_direction()
         self.direction_history.append(raw_direction)
         
-        # Son 10 yönün çoğunluğunu bul
-        if len(self.direction_history) >= 5:
+        # ACİL DURUMLAR HEMEN GEÇMELİ
+        if raw_direction == "DUR":
+            self.stable_direction = "DUR"
+            return "DUR"
+        
+        # Son 5 yönün çoğunluğunu bul (Azaltıldı: 10 -> 5)
+        if len(self.direction_history) >= 3:
             from collections import Counter
-            counts = Counter(self.direction_history)
+            recent = list(self.direction_history)[-5:]  # Son 5
+            counts = Counter(recent)
             most_common = counts.most_common(1)[0]
             
-            # %40 çoğunluk gerekli
-            if most_common[1] >= len(self.direction_history) * 0.4:
+            # %30 çoğunluk yeterli (Azaltıldı: %40 -> %30)
+            if most_common[1] >= len(recent) * 0.30:
                 self.stable_direction = most_common[0]
         
         return self.stable_direction

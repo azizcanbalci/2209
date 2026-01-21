@@ -337,25 +337,25 @@ stable_direction = "DÜZ"  # Stabil yön (söylenecek)
 stability_counter = 0  # Aynı yön kaç kez tekrarlandı
 MIN_STABILITY_COUNT = 5  # Yön değişmeden önce minimum tekrar sayısı
 
-# === AKILLI HAFIZA SİSTEMİ - HIZLI VERSİYON ===
+# === AKILLI HAFIZA SİSTEMİ - RADAR UYUMLU VERSİYON ===
 class SmartNavigator:
     """
-    Akıllı navigasyon hafızası - GERÇEK ZAMANLI yönlendirme için
-    OPTİMİZASYON: Daha kısa bekleme süreleri, daha hızlı tepki
+    Akıllı navigasyon hafızası - RADAR'DAN GELEN YÖNLERE GÖRE
+    Radar zaten akıllı karar veriyor, bu sistem sadece ses çıkışını yönetiyor
     """
     def __init__(self):
-        self.direction_history = deque(maxlen=8)  # Azaltıldı: 15 -> 8
+        self.direction_history = deque(maxlen=5)  # Azaltıldı: 8 -> 5
         self.last_command = None
         self.last_command_time = 0
-        self.command_count = {}  # Komut sayaçları
-        self.movement_state = "IDLE"  # IDLE, MOVING, TURNING
-        self.turn_direction = None  # Hangi yöne dönülüyor
-        self.consecutive_same = 0  # Aynı komut kaç kez üst üste geldi
+        self.command_count = {}
+        self.movement_state = "IDLE"
+        self.turn_direction = None
+        self.consecutive_same = 0
         
-        # === HIZLI TEPKİ AYARLARI (frame sayısı, ~30fps) ===
-        self.min_command_interval = 25  # Azaltıldı: 45 -> 25 (~0.8 saniye)
-        self.urgent_interval = 8  # Azaltıldı: 15 -> 8 (~0.25 saniye)
-        self.direction_change_threshold = 4  # Azaltıldı: 8 -> 4
+        # === ANLIK TEPKİ AYARLARI (frame sayısı, ~30fps) ===
+        self.min_command_interval = 15  # Azaltıldı: 25 -> 15 (~0.5 saniye)
+        self.urgent_interval = 5  # Azaltıldı: 8 -> 5 (~0.17 saniye)
+        self.direction_change_threshold = 2  # Azaltıldı: 4 -> 2
         
     def add_direction(self, direction):
         """Yeni yön ekle ve analiz et"""
@@ -829,11 +829,11 @@ def speak_direction(direction: str, engine):
 
 def stabilize_direction(new_direction: str) -> str:
     """
-    KÖR KULLANICI İÇİN YÖN STABİLİZASYONU - HIZLI VERSİYON
-    Daha kısa stabilizasyon süresi, daha hızlı tepki.
+    KÖR KULLANICI İÇİN YÖN STABİLİZASYONU - RADAR UYUMLU VERSİYON
+    Radar zaten stabil yön veriyor, bu fonksiyon sadece çok hızlı değişimleri önler.
     
     Args:
-        new_direction: Pipeline'dan gelen yeni yön
+        new_direction: Radar'dan gelen yön
     
     Returns:
         str: Stabil yön (söylenecek)
@@ -843,38 +843,41 @@ def stabilize_direction(new_direction: str) -> str:
     # Yeni yönü history'ye ekle
     direction_history.append(new_direction)
     
-    # === ACİL DURUMLAR - HEMEN YANIT ===
-    # DUR komutu beklemeden geçmeli
+    # === ACİL DURUMLAR - HEMEN GEÇ (beklemeden) ===
     if new_direction == "DUR":
         stable_direction = "DUR"
         stability_counter = 0
         return "DUR"
     
-    # Son N yönün çoğunluğunu bul (ağırlıklı - son yönler daha önemli)
-    if len(direction_history) >= 2:  # Azaltıldı: 3 -> 2
-        # Son 4 yönü say (Azaltıldı: 5 -> 4)
-        recent_directions = list(direction_history)[-4:]
+    # HAFIF yönler de hızlı geçmeli
+    if new_direction in ["HAFIF_SOL", "HAFIF_SAG"]:
+        # 1 tekrar yeterli
+        if len(direction_history) >= 1 and direction_history[-1] == new_direction:
+            stable_direction = new_direction
+            return new_direction
+    
+    # Son 3 yönü kontrol et (Azaltıldı: 4 -> 3)
+    if len(direction_history) >= 2:
+        recent_directions = list(direction_history)[-3:]
         direction_counts = {}
         for i, d in enumerate(recent_directions):
-            # Son yönlere daha fazla ağırlık ver
-            weight = 1 + (i * 0.8)  # Artırıldı: 0.5 -> 0.8
+            weight = 1 + i  # Basit ağırlık
             direction_counts[d] = direction_counts.get(d, 0) + weight
         
-        # En yaygın yönü bul
         most_common = max(direction_counts, key=direction_counts.get)
         most_common_score = direction_counts[most_common]
         total_score = sum(direction_counts.values())
         
-        # Yön değişikliği için %50 çoğunluk yeterli (Azaltıldı: %60 -> %50)
-        if most_common_score / total_score >= 0.50:
+        # %40 çoğunluk yeterli (daha esnek)
+        if most_common_score / total_score >= 0.40:
             if most_common != stable_direction:
                 stability_counter += 1
-                # Yön değişikliği için minimum 2 tutarlılık (Azaltıldı: 3 -> 2)
-                if stability_counter >= 2:
+                # 1 tutarlılık yeterli (Azaltıldı: 2 -> 1)
+                if stability_counter >= 1:
                     stable_direction = most_common
                     stability_counter = 0
                     if mode_manager.current_mode == 1:
-                        print(f"[STABİL] Yön değişti: {stable_direction}")
+                        print(f"[RADAR YÖN] {stable_direction}")
             else:
                 stability_counter = 0
     
@@ -1618,8 +1621,8 @@ def main():
                 try: speech_queue.get_nowait()
                 except: pass
             speech_queue.put(emergency_command)
-            danger_cooldown = 20  # Azaltıldı: 40 -> 20 (~0.7 saniye)
-            speech_cooldown = 20
+            danger_cooldown = 12  # Daha da azaltıldı: 20 -> 12 (~0.4 saniye)
+            speech_cooldown = 12
             smart_nav.last_command = emergency_command
             smart_nav.last_command_time = frame_count
             print(f"🚨 ACİL: {emergency_command}")
@@ -1634,7 +1637,7 @@ def main():
                     except: pass
                 speech_queue.put(speak_command)
                 last_spoken_direction = speak_command
-                speech_cooldown = 18  # Azaltıldı: 30 -> 18 (~0.6 saniye)
+                speech_cooldown = 10  # Daha da azaltıldı: 18 -> 10 (~0.33 saniye)
                 print(f"🎯 YÖN: {speak_command}")
         
         # Cooldown azalt
@@ -2182,8 +2185,8 @@ def main_voice_controlled():
                     try: speech_queue.get_nowait()
                     except: pass
                 speech_queue.put(emergency_command)
-                danger_cooldown = 20  # Azaltıldı: 40 -> 20
-                speech_cooldown = 20
+                danger_cooldown = 12  # Daha da azaltıldı: 20 -> 12
+                speech_cooldown = 12
                 smart_nav.last_command = emergency_command
                 smart_nav.last_command_time = frame_count
                 print(f"[ACIL] {emergency_command}")
@@ -2197,7 +2200,7 @@ def main_voice_controlled():
                         try: speech_queue.get_nowait()
                         except: pass
                     speech_queue.put(speak_command)
-                    speech_cooldown = 18  # Azaltıldı: 30 -> 18
+                    speech_cooldown = 10  # Daha da azaltıldı: 18 -> 10
                     print(f"[YON] {speak_command}")
             
             # Görselleştirme

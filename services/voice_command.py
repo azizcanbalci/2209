@@ -87,9 +87,10 @@ class VoiceCommandService:
             print(f"[HATA] Mikrofon hatasi: {e}")
             return False
     
-    def listen(self, timeout=5, phrase_limit=10):
+    def listen(self, timeout=3, phrase_limit=6):
         """
         Mikrofondan ses al ve yazıya çevir.
+        HIZLI VERSİYON - Kısa timeout'lar
         
         Returns:
             tuple: (success, text)
@@ -104,10 +105,10 @@ class VoiceCommandService:
         
         try:
             with self.microphone as source:
-                # Kısa kalibrasyon
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                # Çok kısa kalibrasyon (hız için)
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.2)
                 
-                # Dinle
+                # Dinle - kısa timeout
                 audio = self.recognizer.listen(
                     source,
                     timeout=timeout,
@@ -202,6 +203,7 @@ class VoiceCommandService:
     def wait_for_mode_command(self, speak_func=None):
         """
         Mod seçim menüsünde bekle.
+        HIZLI VERSİYON
         
         Args:
             speak_func: Sesli geri bildirim fonksiyonu (opsiyonel)
@@ -213,7 +215,7 @@ class VoiceCommandService:
             - ('timeout', None): Zaman aşımı
             - ('error', message): Hata
         """
-        success, text = self.listen(timeout=10, phrase_limit=8)
+        success, text = self.listen(timeout=5, phrase_limit=5)
         
         if not success:
             if text is None:  # Timeout
@@ -236,6 +238,7 @@ class VoiceCommandService:
     def wait_for_mode_action(self, current_mode, speak_func=None):
         """
         Mod içinde komut bekle.
+        HIZLI VERSİYON
         
         Args:
             current_mode: Mevcut mod numarası
@@ -251,7 +254,7 @@ class VoiceCommandService:
             - ('timeout', None): Zaman aşımı
             - ('continue', None): Devam et (Mod 1, 3, 7)
         """
-        success, text = self.listen(timeout=8, phrase_limit=15)
+        success, text = self.listen(timeout=4, phrase_limit=8)
         
         if not success:
             if text is None:  # Timeout - sessizlik

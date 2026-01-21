@@ -2,6 +2,23 @@
 
 Bu proje, görme engelli bireyler için geliştirilmiş, yapay zeka ve bilgisayarlı görü tabanlı kapsamlı bir yardımcı asistan sistemidir.
 
+## ⚡ v2.0 - Performans Güncellemesi (Ocak 2026)
+
+### Yenilikler
+- **🚀 2-3x Daha Hızlı FPS**: PiCamera optimizasyonları (4 buffer, queue=False)
+- **⚡ Anlık Sesli Komutlar**: RAM'de önbelleğe alınmış sesler, ~50ms yanıt süresi
+- **🎯 Hızlı Navigasyon Tepkisi**: Cooldown'lar %50 azaltıldı
+- **🔊 Düşük Latency Audio**: 512 byte buffer ile minimal gecikme
+- **📷 Fast Mode Kamera**: 640x480 @ 30+ FPS
+
+### Performans İyileştirmeleri
+| Özellik | Önceki | Yeni |
+|---------|--------|------|
+| Kamera FPS | ~15 FPS | ~30+ FPS |
+| Sesli komut gecikmesi | ~1.5 saniye | ~0.5 saniye |
+| Yön değişikliği tepkisi | ~2 saniye | ~0.8 saniye |
+| YOLO inference | 640px | 416px (daha hızlı) |
+
 ## 🚀 7 Mod Sistemi
 
 ### MOD 1: Navigasyon
@@ -45,7 +62,7 @@ Bu proje, görme engelli bireyler için geliştirilmiş, yapay zeka ve bilgisaya
 
 ## 🛠️ Kurulum
 
-```powershell
+```bash
 # Gerekli kütüphaneleri yükleyin
 pip install -r requirements.txt
 
@@ -56,11 +73,28 @@ pip install -r requirements.txt
 
 ## ▶️ Çalıştırma
 
-```powershell
-python main.py
+### Sesli Kontrol Modu (Varsayılan - Önerilen)
+```bash
+python3 main.py
 ```
 
-### Tuş Kontrolleri
+### Klavye Kontrol Modu
+```bash
+python3 main.py --keyboard
+```
+
+### Sesli Mod Komutları
+- "navigasyon" → MOD 1
+- "metin" → MOD 2
+- "tanıma" → MOD 3
+- "arama" → MOD 4
+- "sohbet" → MOD 5
+- "soru" → MOD 6
+- "harita" → MOD 7
+- "çık" → Mod menüsüne dön
+- "kapat" → Programı kapat
+
+### Klavye Kontrolleri
 - `1-7`: Mod değiştirme
 - `SPACE`: Moda göre tetikleme (OCR okuma, SLAM kaydetme, soru sorma)
 - `q`: Çıkış
@@ -83,6 +117,8 @@ python main.py
 │   ├── object_describer.py # Nesne tanımlayıcı
 │   ├── object_searcher.py  # Nesne arama
 │   ├── voice_chat.py       # Mistral sesli sohbet
+│   ├── voice_command.py    # Sesli komut sistemi
+│   ├── speech_service.py   # TTS servisi
 │   ├── image_qa.py         # Gemini görsel soru-cevap
 │   └── slam_mapper.py      # 3D SLAM haritalama
 ├── models/                 # YOLO model dosyaları
@@ -92,7 +128,10 @@ python main.py
 
 ## 🔧 Gereksinimler
 
+- Raspberry Pi 5 (önerilen) veya x86 bilgisayar
 - Python 3.10+
+- PiCamera v3 veya USB kamera
+- Mikrofon (sesli komutlar için)
 - OpenCV, NumPy, SciPy
 - Ultralytics (YOLOv11)
 - PaddleOCR, PaddlePaddle

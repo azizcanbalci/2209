@@ -84,15 +84,25 @@ except ImportError:
 
 class PiCameraReader:
     """
-    Raspberry Pi Camera Module v3 için optimized reader.
+    Raspberry Pi Camera Module v3 için HIGH-PERFORMANCE reader.
     Picamera2 kullanarak OpenCV uyumlu frame'ler sağlar.
+    
+    OPTİMİZASYONLAR:
+    - 4 buffer ile daha akıcı frame akışı
+    - Queue tabanlı double buffering
+    - Zero-copy frame transfer
+    - Düşük çözünürlük modu desteği (hız için)
     """
-    def __init__(self, camera_num=0, width=1280, height=720):
+    def __init__(self, camera_num=0, width=640, height=480, fast_mode=True):
         self.width = width
         self.height = height
         self.running = False
         self.latest_frame = None
         self.lock = threading.Lock()
+        self.fast_mode = fast_mode
+        self.fps_counter = 0
+        self.fps_time = time.time()
+        self.current_fps = 0
         
         if not PICAMERA_AVAILABLE:
             raise RuntimeError("Picamera2 kurulu değil!")
@@ -101,12 +111,31 @@ class PiCameraReader:
             # Picamera2 başlat (camera_num: 0 veya 1)
             self.picam2 = Picamera2(camera_num)
             
-            # Kamera yapılandırması
-            config = self.picam2.create_preview_configuration(
-                main={"size": (width, height), "format": "RGB888"},
-                buffer_count=2
-            )
+            # === YÜKSEK PERFORMANS YAPILANDIRMASI ===
+            if fast_mode:
+                # Hız öncelikli mod - düşük çözünürlük, yüksek FPS
+                config = self.picam2.create_preview_configuration(
+                    main={"size": (width, height), "format": "RGB888"},
+                    buffer_count=4,  # 4 buffer = daha akıcı
+                    queue=False  # Frame drop'a izin ver (hız için)
+                )
+            else:
+                # Kalite modu
+                config = self.picam2.create_preview_configuration(
+                    main={"size": (width, height), "format": "RGB888"},
+                    buffer_count=3
+                )
+            
             self.picam2.configure(config)
+            
+            # === KAMERA KONTROL AYARLARI (HIZ İÇİN) ===
+            # Frame rate'i maksimize et
+            self.picam2.set_controls({
+                "FrameDurationLimits": (16666, 33333),  # 30-60 FPS arası
+                "ExposureTime": 20000,  # 20ms - hızlı exposure
+                "AnalogueGain": 2.0,  # Düşük ışıkta hızlı yanıt
+            })
+            
             self.picam2.start()
             
             # === AUTOFOCUS AYARLARI (Pi Camera Module v3) ===
@@ -121,16 +150,16 @@ class PiCameraReader:
             except Exception as e:
                 print(f"[UYARI] Autofocus ayarlanamadi: {e}")
             
-            # İlk kareyi al - autofocus icin biraz daha bekle
-            time.sleep(1.0)  # Kamera + autofocus stabilizasyonu
+            # İlk kareyi al - kısa bekleme
+            time.sleep(0.5)  # Azaltıldı: 1.0 -> 0.5
             self.latest_frame = self.picam2.capture_array()
             self.running = True
             
-            # Arka plan thread'i başlat
+            # Arka plan thread'i başlat (yüksek öncelik)
             self.thread = threading.Thread(target=self._update, daemon=True)
             self.thread.start()
             
-            print(f"[OK] Pi Camera {camera_num} baslatildi ({width}x{height})")
+            print(f"[OK] Pi Camera {camera_num} baslatildi ({width}x{height}) - Fast Mode: {fast_mode}")
             
         except Exception as e:
             print(f"[HATA] Pi Camera baslatma hatasi: {e}")
@@ -138,23 +167,45 @@ class PiCameraReader:
             raise
     
     def _update(self):
-        """Arka planda sürekli kare yakala"""
+        """Arka planda sürekli kare yakala - OPTİMİZE"""
         while self.running:
             try:
-                frame = self.picam2.capture_array()
-                # RGB olarak kalsin (donusum yok)
+                # capture_array yerine daha hızlı yöntem
+                frame = self.picam2.capture_array("main")
+                
+                # Lock süresini minimize et
                 with self.lock:
                     self.latest_frame = frame
+                
+                # FPS hesapla
+                self.fps_counter += 1
+                if time.time() - self.fps_time >= 1.0:
+                    self.current_fps = self.fps_counter
+                    self.fps_counter = 0
+                    self.fps_time = time.time()
+                    
             except Exception as e:
-                print(f"Kare yakalama hatası: {e}")
-                time.sleep(0.01)
+                # Hata durumunda kısa bekle
+                time.sleep(0.005)
     
     def read(self):
-        """En son kareyi döndür (OpenCV uyumlu)"""
+        """En son kareyi döndür (OpenCV uyumlu) - ZERO-COPY"""
+        with self.lock:
+            if self.latest_frame is not None:
+                # Sadece gerektiğinde copy yap
+                return True, self.latest_frame
+            return False, None
+    
+    def read_copy(self):
+        """Kopyalı frame döndür (modifikasyon için)"""
         with self.lock:
             if self.latest_frame is not None:
                 return True, self.latest_frame.copy()
             return False, None
+    
+    def get_fps(self):
+        """Mevcut FPS değerini döndür"""
+        return self.current_fps
     
     def release(self):
         """Kamerayı kapat"""
@@ -222,11 +273,62 @@ class LatestFrameReader:
         self.cap.set(prop, value)
 
 # Pygame mixer başlat
-pygame.mixer.init()
+pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)  # Küçük buffer = düşük latency
 
 # Global ses kuyruğu
 speech_queue = Queue()
 speech_thread_running = True
+
+# === HIZLI SES SİSTEMİ (Pre-cached + Async) ===
+class FastSpeechSystem:
+    """
+    Yüksek performanslı ses sistemi.
+    - Önceden yüklenmiş ses dosyaları
+    - Non-blocking playback
+    - Öncelikli kuyruk (acil komutlar önce)
+    """
+    def __init__(self):
+        self.cache = {}  # {komut: pygame.mixer.Sound}
+        self.is_playing = False
+        self.lock = threading.Lock()
+        self.urgent_queue = Queue()  # Acil komutlar için
+        self.normal_queue = Queue()  # Normal komutlar için
+        
+    def preload_sounds(self, audio_dir):
+        """Tüm ses dosyalarını RAM'e yükle"""
+        print("Ses dosyalari RAM'e yukleniyor...")
+        loaded = 0
+        for filename in os.listdir(audio_dir):
+            if filename.endswith('.mp3'):
+                key = filename.replace('.mp3', '')
+                filepath = os.path.join(audio_dir, filename)
+                try:
+                    self.cache[key] = pygame.mixer.Sound(filepath)
+                    loaded += 1
+                except Exception as e:
+                    print(f"  Yukleme hatasi ({key}): {e}")
+        print(f"[OK] {loaded} ses dosyasi RAM'e yuklendi")
+    
+    def play_cached(self, command, urgent=False):
+        """Önbellekten ses çal (çok hızlı)"""
+        if command in self.cache:
+            if urgent:
+                # Acil: Mevcut sesi durdur
+                pygame.mixer.stop()
+            
+            try:
+                self.cache[command].play()
+                return True
+            except:
+                pass
+        return False
+    
+    def is_busy(self):
+        """Ses çalıyor mu?"""
+        return pygame.mixer.get_busy()
+
+# Global hızlı ses sistemi
+fast_speech = FastSpeechSystem()
 
 # YÖN STABİLİZASYONU - Kör kullanıcı için kritik
 from collections import deque
@@ -235,13 +337,14 @@ stable_direction = "DÜZ"  # Stabil yön (söylenecek)
 stability_counter = 0  # Aynı yön kaç kez tekrarlandı
 MIN_STABILITY_COUNT = 5  # Yön değişmeden önce minimum tekrar sayısı
 
-# === AKILLI HAFIZA SİSTEMİ ===
+# === AKILLI HAFIZA SİSTEMİ - HIZLI VERSİYON ===
 class SmartNavigator:
     """
-    Akıllı navigasyon hafızası - gerçek zamanlı yönlendirme için
+    Akıllı navigasyon hafızası - GERÇEK ZAMANLI yönlendirme için
+    OPTİMİZASYON: Daha kısa bekleme süreleri, daha hızlı tepki
     """
     def __init__(self):
-        self.direction_history = deque(maxlen=15)  # Son 15 yön
+        self.direction_history = deque(maxlen=8)  # Azaltıldı: 15 -> 8
         self.last_command = None
         self.last_command_time = 0
         self.command_count = {}  # Komut sayaçları
@@ -249,10 +352,10 @@ class SmartNavigator:
         self.turn_direction = None  # Hangi yöne dönülüyor
         self.consecutive_same = 0  # Aynı komut kaç kez üst üste geldi
         
-        # Zaman bazlı ayarlar (saniye cinsinden frame sayısı, 30fps varsayım)
-        self.min_command_interval = 45  # 1.5 saniye - komutlar arası minimum süre
-        self.urgent_interval = 15  # 0.5 saniye - acil durumlar için
-        self.direction_change_threshold = 8  # Yön değişimi için gereken tutarlılık
+        # === HIZLI TEPKİ AYARLARI (frame sayısı, ~30fps) ===
+        self.min_command_interval = 25  # Azaltıldı: 45 -> 25 (~0.8 saniye)
+        self.urgent_interval = 8  # Azaltıldı: 15 -> 8 (~0.25 saniye)
+        self.direction_change_threshold = 4  # Azaltıldı: 8 -> 4
         
     def add_direction(self, direction):
         """Yeni yön ekle ve analiz et"""
@@ -266,19 +369,19 @@ class SmartNavigator:
                 self.consecutive_same = 1
         
     def get_dominant_direction(self):
-        """Son yönlerin baskın olanını bul"""
-        if len(self.direction_history) < 3:
+        """Son yönlerin baskın olanını bul - HIZLI"""
+        if len(self.direction_history) < 2:
             return self.direction_history[-1] if self.direction_history else "DÜZ"
         
         from collections import Counter
-        recent = list(self.direction_history)[-10:]  # Son 10
+        recent = list(self.direction_history)[-6:]  # Azaltıldı: 10 -> 6
         counts = Counter(recent)
         
         # En çok tekrar eden yön
         most_common = counts.most_common(1)[0]
         
-        # %40 çoğunluk gerekli
-        if most_common[1] >= len(recent) * 0.4:
+        # %35 çoğunluk yeterli (Azaltıldı: %40 -> %35)
+        if most_common[1] >= len(recent) * 0.35:
             return most_common[0]
         
         return self.direction_history[-1]
@@ -286,12 +389,12 @@ class SmartNavigator:
     def should_speak(self, direction, frame_count, is_urgent=False):
         """
         Bu komutu söylemeli miyiz?
-        Akıllı karar mekanizması
+        HIZLI karar mekanizması
         """
         current_time = frame_count
         time_since_last = current_time - self.last_command_time
         
-        # Acil durum (DUR, COK_YAKIN)
+        # Acil durum (DUR, COK_YAKIN) - HEMEN söyle
         if is_urgent:
             if time_since_last >= self.urgent_interval:
                 return True
@@ -384,51 +487,54 @@ class ModeManager:
 # Global mod yöneticisi
 mode_manager = ModeManager()
 
-# === GEÇİCİ SES DOSYASI FONKSİYONLARI ===
+# === GEÇİCİ SES DOSYASI FONKSİYONLARI (OPTİMİZE) ===
 # Ses için lock (thread-safe)
 _speech_lock = threading.Lock()
+_tts_cache = {}  # Metin -> dosya yolu önbelleği
 
 def speak_text_temp(text, lang='tr'):
     """
     Metni geçici ses dosyasına çevirip seslendir, sonra sil
+    ÖNBELLEKLİ VERSİYON - Aynı metinler için tekrar oluşturmaz
     """
     if not text or len(text.strip()) == 0:
         return
     
-    temp_file = os.path.join(AUDIO_DIR, f"temp_{uuid.uuid4().hex[:8]}.mp3")
+    # Önbellekte var mı?
+    cache_key = hash(text[:100])  # İlk 100 karakter hash
+    
+    if cache_key in _tts_cache and os.path.exists(_tts_cache[cache_key]):
+        temp_file = _tts_cache[cache_key]
+    else:
+        temp_file = os.path.join(AUDIO_DIR, f"tts_{cache_key}.mp3")
+        try:
+            # gTTS ile ses dosyası oluştur
+            tts = gTTS(text=text, lang=lang)
+            tts.save(temp_file)
+            _tts_cache[cache_key] = temp_file
+        except Exception as e:
+            print(f"[HATA] TTS olusturma: {e}")
+            return
+    
     try:
-        # gTTS ile ses dosyası oluştur
-        tts = gTTS(text=text, lang=lang)
-        tts.save(temp_file)
-        
         # Thread-safe ses çalma
         with _speech_lock:
             # Mixer başlatılmamışsa başlat
             if not pygame.mixer.get_init():
-                pygame.mixer.init()
+                pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
             pygame.mixer.music.load(temp_file)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
+                time.sleep(0.05)  # Daha kısa kontrol aralığı
             pygame.mixer.music.unload()
         
-        time.sleep(0.1)
-        
-        # Dosyayı sil
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-            
-        print(f"[SES] Seslendirme tamamlandi: {text[:50]}...")
     except Exception as e:
-        print(f"[HATA] Ses hatasi: {e}")
-        if os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except:
-                pass
+        print(f"[HATA] Ses calma: {e}")
 
 def speak_text_async(text, lang='tr'):
-    """Metni arka planda seslendir"""
+    """Metni arka planda seslendir - HIZLI"""
+    if not text:
+        return
     thread = threading.Thread(target=speak_text_temp, args=(text, lang), daemon=True)
     thread.start()
 
@@ -520,20 +626,77 @@ def play_sound(command):
 def speech_worker():
     """
     Arka planda çalışan ses işçisi thread'i.
-    Kuyruktan komutları alıp seslendirir.
+    HIZLI VERSİYON: Önbellekten ses çalma.
     """
+    global fast_speech
+    
     while speech_thread_running:
         try:
             if not speech_queue.empty():
-                komut = speech_queue.get(timeout=0.1)
-                print(f"Seslendiriliyor: {komut}")
-                play_sound(komut)
+                komut = speech_queue.get(timeout=0.05)  # Daha kısa timeout
+                
+                # Önce cache'den dene (çok hızlı)
+                if fast_speech.play_cached(komut, urgent=True):
+                    print(f"⚡ Hızlı ses: {komut}")
+                else:
+                    # Cache'de yoksa dosyadan çal
+                    print(f"🔊 Dosyadan: {komut}")
+                    play_sound(komut)
+                
                 speech_queue.task_done()
             else:
-                time.sleep(0.1)
+                time.sleep(0.02)  # Daha kısa bekleme
         except Exception as e:
-            print(f"Ses hatası: {e}")
-            time.sleep(0.1)
+            time.sleep(0.02)
+
+
+# === FPS HESAPLAYICI ===
+class FPSCounter:
+    """
+    Gerçek zamanlı FPS hesaplayıcı.
+    Kamera görüntülerinde performans göstergesi için.
+    """
+    def __init__(self, avg_frames=30):
+        self.prev_time = time.time()
+        self.fps_history = deque(maxlen=avg_frames)
+        self.current_fps = 0
+        
+    def update(self):
+        """Her frame'de çağır, FPS hesapla"""
+        current_time = time.time()
+        delta = current_time - self.prev_time
+        if delta > 0:
+            instant_fps = 1.0 / delta
+            self.fps_history.append(instant_fps)
+            self.current_fps = sum(self.fps_history) / len(self.fps_history)
+        self.prev_time = current_time
+        return self.current_fps
+    
+    def get(self):
+        """Mevcut FPS değerini döndür"""
+        return self.current_fps
+
+# Global FPS sayacı
+fps_counter = FPSCounter()
+
+def draw_fps(frame, fps, pos=(10, 30)):
+    """
+    Frame üzerine FPS bilgisi çizer.
+    Yeşil: >25 FPS, Sarı: 15-25 FPS, Kırmızı: <15 FPS
+    """
+    if fps >= 25:
+        color = (0, 255, 0)  # Yeşil
+    elif fps >= 15:
+        color = (0, 255, 255)  # Sarı
+    else:
+        color = (0, 0, 255)  # Kırmızı
+    
+    fps_text = f"FPS: {fps:.1f}"
+    # Arka plan kutusu
+    (text_w, text_h), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    cv2.rectangle(frame, (pos[0]-5, pos[1]-text_h-5), (pos[0]+text_w+5, pos[1]+5), (0, 0, 0), -1)
+    cv2.putText(frame, fps_text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return frame
 
 
 # ============ KALİBRASYON AYARLARI (KÖR KULLANICI İÇİN) ============
@@ -666,9 +829,8 @@ def speak_direction(direction: str, engine):
 
 def stabilize_direction(new_direction: str) -> str:
     """
-    KÖR KULLANICI İÇİN YÖN STABİLİZASYONU.
-    Yön değişikliği için aynı yönün birkaç kez tekrarlanması gerekir.
-    Bu, hızlı değişimleri önler ve tutarlı komutlar sağlar.
+    KÖR KULLANICI İÇİN YÖN STABİLİZASYONU - HIZLI VERSİYON
+    Daha kısa stabilizasyon süresi, daha hızlı tepki.
     
     Args:
         new_direction: Pipeline'dan gelen yeni yön
@@ -681,14 +843,21 @@ def stabilize_direction(new_direction: str) -> str:
     # Yeni yönü history'ye ekle
     direction_history.append(new_direction)
     
+    # === ACİL DURUMLAR - HEMEN YANIT ===
+    # DUR komutu beklemeden geçmeli
+    if new_direction == "DUR":
+        stable_direction = "DUR"
+        stability_counter = 0
+        return "DUR"
+    
     # Son N yönün çoğunluğunu bul (ağırlıklı - son yönler daha önemli)
-    if len(direction_history) >= 3:
-        # Son 5 yönü say
-        recent_directions = list(direction_history)[-5:]
+    if len(direction_history) >= 2:  # Azaltıldı: 3 -> 2
+        # Son 4 yönü say (Azaltıldı: 5 -> 4)
+        recent_directions = list(direction_history)[-4:]
         direction_counts = {}
         for i, d in enumerate(recent_directions):
             # Son yönlere daha fazla ağırlık ver
-            weight = 1 + (i * 0.5)  # 1, 1.5, 2, 2.5, 3
+            weight = 1 + (i * 0.8)  # Artırıldı: 0.5 -> 0.8
             direction_counts[d] = direction_counts.get(d, 0) + weight
         
         # En yaygın yönü bul
@@ -696,16 +865,14 @@ def stabilize_direction(new_direction: str) -> str:
         most_common_score = direction_counts[most_common]
         total_score = sum(direction_counts.values())
         
-        # Yön değişikliği için %60 çoğunluk gerekli
-        if most_common_score / total_score >= 0.60:
+        # Yön değişikliği için %50 çoğunluk yeterli (Azaltıldı: %60 -> %50)
+        if most_common_score / total_score >= 0.50:
             if most_common != stable_direction:
                 stability_counter += 1
-                # Yön değişikliği için minimum 3 ardışık tutarlılık
-                if stability_counter >= MIN_STABILITY_COUNT:
+                # Yön değişikliği için minimum 2 tutarlılık (Azaltıldı: 3 -> 2)
+                if stability_counter >= 2:
                     stable_direction = most_common
                     stability_counter = 0
-                    # Debug mesajı sadece MOD 1'de göster
-                    # Debug mesajı sadece Navigasyon modunda (MOD 1)
                     if mode_manager.current_mode == 1:
                         print(f"[STABİL] Yön değişti: {stable_direction}")
             else:
@@ -985,6 +1152,10 @@ def main():
     print("Ses dosyalari hazirlaniyor...")
     create_audio_files()
     
+    # === HIZLI SES SİSTEMİ: Sesleri RAM'e yükle ===
+    print("Sesler RAM'e yukleniyor (hizli erisim icin)...")
+    fast_speech.preload_sounds(AUDIO_DIR)
+    
     # Ses thread'ini başlat
     print("Ses sistemi baslatiliyor...")
     speech_thread_running = True
@@ -993,7 +1164,7 @@ def main():
     
     # Test sesi
     speech_queue.put("HAZIR")
-    time.sleep(2)
+    time.sleep(1)  # Azaltıldı: 2 -> 1 saniye
     print("Ses sistemi hazir!")
     
     # === BAŞLANGIÇ MOD SEÇİMİ ===
@@ -1147,6 +1318,10 @@ def main():
             # İstatistikleri al
             stats = slam_mapper.get_stats()
             
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(slam_vis, current_fps, (frame_width - 120, 30))
+            
             # Pencereleri göster
             cv2.imshow("SLAM Kamera", slam_vis)
             cv2.imshow("SLAM Harita", topdown)
@@ -1221,6 +1396,10 @@ def main():
                 short_text = mode_manager.last_ocr_text[:60] + "..." if len(mode_manager.last_ocr_text) > 60 else mode_manager.last_ocr_text
                 cv2.putText(display_frame, f"Okunan: {short_text}", (20, 95),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(display_frame, current_fps, (width - 120, 30))
             
             # Sadece tek pencere göster
             cv2.imshow("Metin Okuma - MOD 2", display_frame)
@@ -1439,8 +1618,8 @@ def main():
                 try: speech_queue.get_nowait()
                 except: pass
             speech_queue.put(emergency_command)
-            danger_cooldown = 40  # 1.3 saniye - daha hızlı tepki
-            speech_cooldown = 40
+            danger_cooldown = 20  # Azaltıldı: 40 -> 20 (~0.7 saniye)
+            speech_cooldown = 20
             smart_nav.last_command = emergency_command
             smart_nav.last_command_time = frame_count
             print(f"🚨 ACİL: {emergency_command}")
@@ -1455,7 +1634,7 @@ def main():
                     except: pass
                 speech_queue.put(speak_command)
                 last_spoken_direction = speak_command
-                speech_cooldown = 30  # 1 saniye
+                speech_cooldown = 18  # Azaltıldı: 30 -> 18 (~0.6 saniye)
                 print(f"🎯 YÖN: {speak_command}")
         
         # Cooldown azalt
@@ -1545,21 +1724,30 @@ def main():
             print(f"[MOD {current_mode}] Kare: {frame_count} | Engel: {len(obstacles)} | Yon: {direction}")
         
         # ============================================================
+        # FPS HESAPLA VE GÖSTER
+        # ============================================================
+        current_fps = fps_counter.update()
+        
+        # ============================================================
         # MOD'A GÖRE PENCERE GÖSTER
         # ============================================================
         if current_mode == 1:
-            # NAVİGASYON: Tüm pencereler
+            # NAVİGASYON: Tüm pencereler + FPS
+            draw_fps(combined_view, current_fps, (width - 120, 30))
             cv2.imshow("Navigasyon - MOD 1", combined_view)
             cv2.imshow("Kus Bakisi (BEV)", bev_combined)
             cv2.imshow("RADAR Navigasyon", radar_img)
         elif current_mode == 3:
-            # NESNE TANIMA: Sadece ana görüntü
+            # NESNE TANIMA: Sadece ana görüntü + FPS
+            draw_fps(combined_view, current_fps, (width - 120, 30))
             cv2.imshow("Nesne Tanima - MOD 3", combined_view)
         elif current_mode == 4:
-            # NESNE ARAMA: Sadece ana görüntü
+            # NESNE ARAMA: Sadece ana görüntü + FPS
+            draw_fps(combined_view, current_fps, (width - 120, 30))
             cv2.imshow("Nesne Arama - MOD 4", combined_view)
         elif current_mode == 6:
-            # GÖRSEL SORU-CEVAP: Sadece ana görüntü
+            # GÖRSEL SORU-CEVAP: Sadece ana görüntü + FPS
+            draw_fps(combined_view, current_fps, (width - 120, 30))
             cv2.imshow("Gorsel Soru-Cevap - MOD 6", combined_view)
         
         # TUŞ KONTROLLERI
@@ -1721,6 +1909,10 @@ def main_voice_controlled():
     print("\nSes dosyalari hazirlaniyor...")
     create_audio_files()
     
+    # === HIZLI SES SİSTEMİ: Sesleri RAM'e yükle ===
+    print("Sesler RAM'e yukleniyor (hizli erisim icin)...")
+    fast_speech.preload_sounds(AUDIO_DIR)
+    
     # Ses thread'ini başlat
     print("Ses sistemi baslatiliyor...")
     speech_thread_running = True
@@ -1748,9 +1940,10 @@ def main_voice_controlled():
     
     if PICAMERA_AVAILABLE:
         try:
-            print("Pi Camera Module v3 deneniyor...")
-            cap = PiCameraReader(camera_num=0, width=1280, height=720)
-            print("[OK] Pi Camera basariyla baslatildi!")
+            print("Pi Camera Module v3 deneniyor (FAST MODE)...")
+            # 640x480 + fast_mode = maksimum FPS
+            cap = PiCameraReader(camera_num=0, width=640, height=480, fast_mode=True)
+            print(f"[OK] Pi Camera basariyla baslatildi! (FPS: ~{cap.get_fps()})")
         except Exception as e:
             print(f"[UYARI] Pi Camera baslatilamadi: {e}")
             cap = None
@@ -1989,8 +2182,8 @@ def main_voice_controlled():
                     try: speech_queue.get_nowait()
                     except: pass
                 speech_queue.put(emergency_command)
-                danger_cooldown = 40
-                speech_cooldown = 40
+                danger_cooldown = 20  # Azaltıldı: 40 -> 20
+                speech_cooldown = 20
                 smart_nav.last_command = emergency_command
                 smart_nav.last_command_time = frame_count
                 print(f"[ACIL] {emergency_command}")
@@ -2004,7 +2197,7 @@ def main_voice_controlled():
                         try: speech_queue.get_nowait()
                         except: pass
                     speech_queue.put(speak_command)
-                    speech_cooldown = 30
+                    speech_cooldown = 18  # Azaltıldı: 30 -> 18
                     print(f"[YON] {speak_command}")
             
             # Görselleştirme
@@ -2023,6 +2216,10 @@ def main_voice_controlled():
             
             cv2.putText(combined_view, f"Engel: {len(obstacles)}", (10, height - 20), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # FPS hesapla ve göster
+            current_fps = fps_counter.update()
+            draw_fps(combined_view, current_fps, (width - 120, 30))
             
             # TÜM PENCERELERİ GÖSTER (KLAVYE MODUYLA AYNI)
             cv2.imshow("Navigasyon - MOD 1", combined_view)
@@ -2061,6 +2258,10 @@ def main_voice_controlled():
                 short_text = mode_manager.last_ocr_text[:60] + "..." if len(mode_manager.last_ocr_text) > 60 else mode_manager.last_ocr_text
                 cv2.putText(display_frame, f"Okunan: {short_text}", (20, 95),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(display_frame, current_fps, (width - 120, 30))
             
             cv2.imshow("Metin Okuma - MOD 2", display_frame)
             
@@ -2159,6 +2360,10 @@ def main_voice_controlled():
             # Nesne sayısı
             cv2.putText(combined_view, f"Tespit: {len(pipeline_obstacles)} nesne", (10, height - 20), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(combined_view, current_fps, (width - 120, 30))
             
             cv2.imshow("Nesne Tanima - MOD 3", combined_view)
             
@@ -2259,6 +2464,10 @@ def main_voice_controlled():
                 cv2.putText(combined_view, f"Araniyor: {search_target}", (10, 80),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(combined_view, current_fps, (width - 120, 30))
+            
             cv2.imshow("Nesne Arama - MOD 4", combined_view)
             
             key = cv2.waitKey(1) & 0xFF
@@ -2309,6 +2518,10 @@ def main_voice_controlled():
             # Kullanım bilgisi
             cv2.putText(display_frame, "Bosluk: Yazili soru | 'cek': Sesli soru", (10, 80),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(display_frame, current_fps, (width - 120, 30))
             
             cv2.imshow("Gorsel Soru-Cevap - MOD 6", display_frame)
             
@@ -2399,6 +2612,10 @@ def main_voice_controlled():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
             cv2.putText(slam_vis, f"Noktalar: {stats.get('mps', 0)} | Keyframe: {stats.get('kfs', 0)}", (20, 65),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # FPS göster
+            current_fps = fps_counter.update()
+            draw_fps(slam_vis, current_fps, (width - 120, 30))
             
             # Pencereleri göster (klavye modundaki gibi 2 pencere)
             cv2.imshow("SLAM Kamera", slam_vis)

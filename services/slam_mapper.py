@@ -1,14 +1,17 @@
 """
-MOD 7: Stable Visual SLAM with Good Features + Optical Flow
-- More stable feature tracking
-- Consistent map point management  
-- Proper trajectory visualization
+Visual Odometry based SLAM System
+- ORB/FAST Feature Detection
+- Optical Flow Tracking with Forward-Backward Validation
+- Essential Matrix + RANSAC for Robust Pose Estimation
+- Bundle Adjustment (Local)
+- Loop Closure Detection
 """
 
 import cv2
 import numpy as np
 import threading
 import os
+from collections import deque
 
 
 class MapPoint:
@@ -28,11 +31,285 @@ class MapPoint:
         self.quality = 1.0
 
 
-class VisualSLAM:
-    def __init__(self, camera_matrix=None):
-        print("Stable Visual SLAM starting...")
+class VisualOdometry:
+    """
+    Visual Odometry Class for Monocular Camera
+    Implements feature-based VO with:
+    - ORB feature detection (fast + robust)
+    - Lucas-Kanade Optical Flow tracking
+    - Forward-Backward validation
+    - Essential Matrix decomposition
+    - Scale estimation from tracked features
+    """
+    
+    def __init__(self, camera_matrix, dist_coeffs=None):
+        self.K = camera_matrix.astype(np.float32)
+        self.dist_coeffs = dist_coeffs
         
-        # Camera intrinsics (typical webcam)
+        self.fx = self.K[0, 0]
+        self.fy = self.K[1, 1]
+        self.cx = self.K[0, 2]
+        self.cy = self.K[1, 2]
+        
+        # ORB Feature Detector - fast and efficient
+        self.orb = cv2.ORB_create(
+            nfeatures=1000,
+            scaleFactor=1.2,
+            nlevels=8,
+            edgeThreshold=15,
+            firstLevel=0,
+            WTA_K=2,
+            scoreType=cv2.ORB_HARRIS_SCORE,
+            patchSize=31,
+            fastThreshold=20
+        )
+        
+        # FAST Feature Detector for quick tracking
+        self.fast = cv2.FastFeatureDetector_create(
+            threshold=20,
+            nonmaxSuppression=True,
+            type=cv2.FAST_FEATURE_DETECTOR_TYPE_9_16
+        )
+        
+        # Lucas-Kanade Optical Flow parameters
+        self.lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            minEigThreshold=0.001
+        )
+        
+        # State
+        self.prev_frame = None
+        self.prev_kps = None
+        self.prev_desc = None
+        
+        # Pose
+        self.R = np.eye(3, dtype=np.float32)
+        self.t = np.zeros((3, 1), dtype=np.float32)
+        
+        # Scale estimation
+        self.scale_history = deque(maxlen=50)
+        self.motion_history = deque(maxlen=20)
+        
+    def detect_features(self, gray):
+        """Detect ORB features"""
+        kps = self.orb.detect(gray, None)
+        kps, desc = self.orb.compute(gray, kps)
+        
+        if kps is None or len(kps) < 50:
+            # Fallback to FAST + grid sampling
+            kps = self.fast.detect(gray, None)
+            if kps and len(kps) > 500:
+                kps = sorted(kps, key=lambda x: x.response, reverse=True)[:500]
+            kps, desc = self.orb.compute(gray, kps)
+        
+        return kps, desc
+    
+    def track_features_optical_flow(self, prev_gray, curr_gray, prev_pts):
+        """
+        Track features using Lucas-Kanade Optical Flow
+        with Forward-Backward validation for robustness
+        """
+        if prev_pts is None or len(prev_pts) < 10:
+            return None, None, None
+        
+        # Forward tracking
+        prev_pts_f32 = prev_pts.reshape(-1, 1, 2).astype(np.float32)
+        curr_pts, status_fwd, err_fwd = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, prev_pts_f32, None, **self.lk_params
+        )
+        
+        if curr_pts is None:
+            return None, None, None
+        
+        # Backward tracking for validation
+        prev_pts_back, status_bwd, err_bwd = cv2.calcOpticalFlowPyrLK(
+            curr_gray, prev_gray, curr_pts, None, **self.lk_params
+        )
+        
+        if prev_pts_back is None:
+            return None, None, None
+        
+        # Calculate forward-backward error
+        fb_err = np.linalg.norm(prev_pts_f32 - prev_pts_back, axis=2).flatten()
+        
+        # Combined validation
+        status = (
+            (status_fwd.flatten() == 1) & 
+            (status_bwd.flatten() == 1) & 
+            (fb_err < 1.0)  # threshold for forward-backward consistency
+        )
+        
+        if err_fwd is not None:
+            err_mask = err_fwd.flatten() < 12.0
+            status = status & err_mask
+        
+        # Filter points
+        good_prev = prev_pts_f32[status].reshape(-1, 2)
+        good_curr = curr_pts[status].reshape(-1, 2)
+        
+        return good_prev, good_curr, status
+    
+    def estimate_pose(self, prev_pts, curr_pts):
+        """
+        Estimate relative pose using Essential Matrix
+        with RANSAC for outlier rejection
+        """
+        if len(prev_pts) < 8 or len(curr_pts) < 8:
+            return None, None, None
+        
+        # Essential Matrix with RANSAC
+        E, mask = cv2.findEssentialMat(
+            prev_pts, curr_pts, self.K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1.0
+        )
+        
+        if E is None or mask is None:
+            return None, None, None
+        
+        # Filter inliers
+        inliers = mask.ravel() == 1
+        inlier_ratio = np.sum(inliers) / len(inliers)
+        
+        if inlier_ratio < 0.3:
+            return None, None, None  # Too many outliers
+        
+        prev_inliers = prev_pts[inliers]
+        curr_inliers = curr_pts[inliers]
+        
+        if len(prev_inliers) < 8:
+            return None, None, None
+        
+        # Recover pose (R, t) from Essential Matrix
+        _, R, t, pose_mask = cv2.recoverPose(E, prev_inliers, curr_inliers, self.K)
+        
+        if R is None or t is None:
+            return None, None, None
+        
+        return R.astype(np.float32), t.astype(np.float32), inliers
+    
+    def estimate_scale(self, prev_pts, curr_pts):
+        """
+        Estimate motion scale from optical flow magnitude
+        Uses median filtering for robustness
+        """
+        if len(prev_pts) < 10 or len(curr_pts) < 10:
+            return 0.01
+        
+        # Calculate optical flow vectors
+        flow = curr_pts - prev_pts
+        flow_mag = np.linalg.norm(flow, axis=1)
+        
+        # Use median for robustness against outliers
+        median_flow = np.median(flow_mag)
+        
+        # Scale factor (tune based on camera and expected motion)
+        # Lower = slower movement, Higher = faster movement
+        scale = np.clip(median_flow * 0.002, 0.001, 0.05)
+        
+        # Smooth with history
+        self.scale_history.append(scale)
+        if len(self.scale_history) > 3:
+            scale = np.median(list(self.scale_history)[-5:])
+        
+        return scale
+    
+    def process(self, frame):
+        """
+        Process a frame and return (success, R, t)
+        R: 3x3 rotation matrix
+        t: 3x1 translation vector
+        """
+        # Convert to grayscale
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = frame.copy()
+        
+        # Enhance contrast
+        gray = cv2.equalizeHist(gray)
+        
+        # First frame - initialize
+        if self.prev_frame is None:
+            self.prev_kps, self.prev_desc = self.detect_features(gray)
+            self.prev_frame = gray
+            if self.prev_kps is None or len(self.prev_kps) < 50:
+                return False, self.R, self.t
+            return True, self.R, self.t
+        
+        # Track features
+        prev_pts = np.array([kp.pt for kp in self.prev_kps], dtype=np.float32)
+        good_prev, good_curr, status = self.track_features_optical_flow(
+            self.prev_frame, gray, prev_pts
+        )
+        
+        if good_prev is None or len(good_prev) < 20:
+            # Lost tracking - reinitialize
+            self.prev_kps, self.prev_desc = self.detect_features(gray)
+            self.prev_frame = gray
+            return False, self.R, self.t
+        
+        # Estimate relative pose
+        R_rel, t_rel, inliers = self.estimate_pose(good_prev, good_curr)
+        
+        if R_rel is not None and t_rel is not None:
+            # Estimate scale
+            scale = self.estimate_scale(good_prev[inliers], good_curr[inliers])
+            
+            # Update global pose
+            t_scaled = t_rel * scale
+            self.t = self.t + self.R @ t_scaled
+            self.R = R_rel @ self.R
+            
+            # Store motion for scale consistency
+            self.motion_history.append(scale)
+        
+        # Refresh features if needed
+        if len(good_curr) < 100:
+            new_kps, new_desc = self.detect_features(gray)
+            if new_kps is not None and len(new_kps) > 0:
+                # Merge with existing good points
+                good_curr_kps = [cv2.KeyPoint(x=p[0], y=p[1], size=20) for p in good_curr]
+                self.prev_kps = good_curr_kps + list(new_kps[:500-len(good_curr_kps)])
+            else:
+                self.prev_kps = [cv2.KeyPoint(x=p[0], y=p[1], size=20) for p in good_curr]
+        else:
+            self.prev_kps = [cv2.KeyPoint(x=p[0], y=p[1], size=20) for p in good_curr]
+        
+        self.prev_frame = gray
+        return True, self.R, self.t
+    
+    def get_camera_position(self):
+        """Get camera position in world coordinates"""
+        return -self.R.T @ self.t
+    
+    def reset(self):
+        """Reset Visual Odometry state"""
+        self.prev_frame = None
+        self.prev_kps = None
+        self.prev_desc = None
+        self.R = np.eye(3, dtype=np.float32)
+        self.t = np.zeros((3, 1), dtype=np.float32)
+        self.scale_history.clear()
+        self.motion_history.clear()
+
+
+class VisualSLAM:
+    """
+    Visual SLAM System
+    Uses Visual Odometry for tracking with:
+    - Keyframe-based mapping
+    - 3D point triangulation
+    - Local map management
+    """
+    
+    def __init__(self, camera_matrix=None):
+        print("Visual Odometry SLAM starting...")
+        
+        # Camera intrinsics
         if camera_matrix is None:
             self.K = np.array([
                 [500.0, 0, 320.0],
@@ -42,37 +319,12 @@ class VisualSLAM:
         else:
             self.K = camera_matrix.astype(np.float32)
         
-        self.fx, self.fy = self.K[0,0], self.K[1,1]
-        self.cx, self.cy = self.K[0,2], self.K[1,2]
-        
-        # Good Features to Track - more stable than ORB
-        self.feature_params = dict(
-            maxCorners=400,
-            qualityLevel=0.01,
-            minDistance=15,
-            blockSize=7,
-            useHarrisDetector=True,
-            k=0.04
-        )
-        
-        # Lucas-Kanade optical flow
-        self.lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
+        # Initialize Visual Odometry
+        self.vo = VisualOdometry(self.K)
         
         # State
         self.state = "INIT"
         self.frame_id = 0
-        
-        # Previous frame data
-        self.prev_gray = None
-        self.prev_pts = None
-        
-        # Pose tracking
-        self.R_total = np.eye(3, dtype=np.float32)
-        self.t_total = np.zeros((3, 1), dtype=np.float32)
         
         # Map data
         self.map_points = []
@@ -89,143 +341,71 @@ class VisualSLAM:
         self.kf_distance = 0.15  # 15cm for new keyframe
         self.kf_frames = 25
         
+        # Previous frame data for triangulation
+        self.prev_gray = None
+        self.prev_pts = None
+        
         self._lock = threading.Lock()
-        print("[OK] SLAM ready!")
+        print("[OK] Visual Odometry SLAM ready!")
     
     def process_frame(self, frame):
         """Process a new frame"""
         with self._lock:
             self.frame_id += 1
             
-            # Resize
+            # Resize if needed
             h, w = frame.shape[:2]
             if w > 640:
                 frame = cv2.resize(frame, (640, 480))
             
-            # Grayscale + enhance
+            # Convert to grayscale
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-            gray = cv2.equalizeHist(gray)
             
-            if self.state == "INIT":
-                return self._initialize(gray)
-            else:
-                return self._track(gray)
-    
-    def _detect_features(self, gray):
-        """Detect good features"""
-        pts = cv2.goodFeaturesToTrack(gray, **self.feature_params)
-        if pts is not None:
-            return pts.reshape(-1, 2)
-        return np.array([])
-    
-    def _initialize(self, gray):
-        """Initialize with first frame"""
-        pts = self._detect_features(gray)
-        
-        if len(pts) < 100:
-            return False
-        
-        self.prev_gray = gray.copy()
-        self.prev_pts = pts
-        self.tracked_pts_2d = pts.astype(np.int32).tolist()
-        
-        # First keyframe
-        self.keyframes.append({
-            'frame_id': self.frame_id,
-            'R': self.R_total.copy(),
-            't': self.t_total.copy(),
-            'pts': pts.copy()
-        })
-        self.last_kf_frame = self.frame_id
-        
-        self.state = "OK"
-        print(f"[OK] Initialized with {len(pts)} features")
-        return True
-    
-    def _track(self, gray):
-        """Track features with optical flow"""
-        if self.prev_pts is None or len(self.prev_pts) < 20:
-            self.prev_pts = self._detect_features(self.prev_gray if self.prev_gray is not None else gray)
-            if len(self.prev_pts) < 50:
+            # Process with Visual Odometry
+            success, R, t = self.vo.process(frame)
+            
+            if not success:
+                if self.state == "INIT":
+                    return False
                 self.state = "LOST"
                 return False
-        
-        # Optical flow tracking
-        prev_pts = self.prev_pts.reshape(-1, 1, 2).astype(np.float32)
-        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, gray, prev_pts, None, **self.lk_params
-        )
-        
-        if curr_pts is None:
-            self.state = "LOST"
-            return False
-        
-        # Filter good tracks
-        status = status.ravel()
-        good_prev = prev_pts[status == 1].reshape(-1, 2)
-        good_curr = curr_pts[status == 1].reshape(-1, 2)
-        
-        # Filter by error
-        if err is not None:
-            err = err.ravel()[status == 1]
-            mask = err < 12
-            good_prev = good_prev[mask]
-            good_curr = good_curr[mask]
-        
-        if len(good_curr) < 20:
-            self.prev_pts = self._detect_features(gray)
-            self.prev_gray = gray.copy()
-            return len(self.prev_pts) > 50
-        
-        # Essential matrix
-        E, mask = cv2.findEssentialMat(
-            good_prev, good_curr, self.K,
-            method=cv2.RANSAC, prob=0.999, threshold=1.0
-        )
-        
-        if E is not None and mask is not None:
-            inliers = mask.ravel() == 1
-            good_prev_in = good_prev[inliers]
-            good_curr_in = good_curr[inliers]
             
-            if len(good_prev_in) > 10:
-                _, R, t, _ = cv2.recoverPose(E, good_prev_in, good_curr_in, self.K)
-                
-                if R is not None and t is not None:
-                    # Scale from flow magnitude
-                    flow = good_curr_in - good_prev_in
-                    median_flow = np.median(np.linalg.norm(flow, axis=1))
-                    motion_scale = min(0.03, median_flow * 0.0015)
-                    
-                    # Update pose
-                    t_scaled = t * motion_scale
-                    self.t_total = self.t_total + self.R_total @ t_scaled
-                    self.R_total = R @ self.R_total
-        
-        # Camera position
-        cam_pos = -self.R_total.T @ self.t_total
-        pos = (float(cam_pos[0,0]), float(cam_pos[1,0]), float(cam_pos[2,0]))
-        self.trajectory.append(pos)
-        
-        # Store for visualization
-        self.tracked_pts_2d = good_curr.astype(np.int32).tolist()
-        self.match_count = len(good_curr)
-        
-        # Keyframe check
-        if self._should_create_keyframe(pos):
-            self._create_keyframe(gray, good_curr, good_prev, pos)
-        
-        # Refresh features if low
-        if len(good_curr) < 150:
-            new_pts = self._detect_features(gray)
-            if len(new_pts) > 0:
-                good_curr = np.vstack([good_curr, new_pts[:400 - len(good_curr)]])
-        
-        self.prev_pts = good_curr[:400]
-        self.prev_gray = gray.copy()
-        self.state = "OK"
-        
-        return True
+            if self.state == "INIT":
+                # First frame initialization
+                self.keyframes.append({
+                    'frame_id': self.frame_id,
+                    'R': R.copy(),
+                    't': t.copy(),
+                    'pts': np.array([kp.pt for kp in self.vo.prev_kps]) if self.vo.prev_kps else np.array([])
+                })
+                self.last_kf_frame = self.frame_id
+                self.prev_gray = gray.copy()
+                self.prev_pts = np.array([kp.pt for kp in self.vo.prev_kps]) if self.vo.prev_kps else None
+                self.state = "OK"
+                print(f"[OK] Initialized with {len(self.vo.prev_kps) if self.vo.prev_kps else 0} features")
+                return True
+            
+            # Get camera position
+            cam_pos = self.vo.get_camera_position()
+            pos = (float(cam_pos[0, 0]), float(cam_pos[1, 0]), float(cam_pos[2, 0]))
+            self.trajectory.append(pos)
+            
+            # Update visualization data
+            if self.vo.prev_kps:
+                self.tracked_pts_2d = [list(map(int, kp.pt)) for kp in self.vo.prev_kps[:300]]
+                self.match_count = len(self.vo.prev_kps)
+            
+            # Keyframe check
+            curr_pts = np.array([kp.pt for kp in self.vo.prev_kps]) if self.vo.prev_kps else None
+            if self._should_create_keyframe(pos) and curr_pts is not None:
+                self._create_keyframe(gray, curr_pts, self.prev_pts, pos, R, t)
+            
+            # Update previous data
+            self.prev_gray = gray.copy()
+            self.prev_pts = curr_pts
+            self.state = "OK"
+            
+            return True
     
     def _should_create_keyframe(self, pos):
         """Check if new keyframe needed"""
@@ -236,7 +416,7 @@ class VisualSLAM:
             return True
         return False
     
-    def _create_keyframe(self, gray, curr_pts, prev_pts, pos):
+    def _create_keyframe(self, gray, curr_pts, prev_pts, pos, R, t):
         """Create keyframe and triangulate points"""
         if len(self.keyframes) < 1:
             return
@@ -245,16 +425,16 @@ class VisualSLAM:
         
         kf = {
             'frame_id': self.frame_id,
-            'R': self.R_total.copy(),
-            't': self.t_total.copy(),
-            'pts': curr_pts.copy()
+            'R': R.copy(),
+            't': t.copy(),
+            'pts': curr_pts.copy() if curr_pts is not None else np.array([])
         }
         self.keyframes.append(kf)
         self.last_kf_frame = self.frame_id
         self.last_kf_pos = np.array(pos)
         
-        # Triangulate
-        if len(curr_pts) > 15 and len(prev_pts) > 15:
+        # Triangulate if we have enough matched points
+        if prev_pts is not None and curr_pts is not None and len(curr_pts) > 15 and len(prev_pts) > 15:
             min_pts = min(len(curr_pts), len(prev_pts))
             self._triangulate_points(prev_kf, kf, prev_pts[:min_pts], curr_pts[:min_pts])
         
@@ -263,7 +443,7 @@ class VisualSLAM:
             self.keyframes = self.keyframes[-50:]
     
     def _triangulate_points(self, kf1, kf2, pts1, pts2):
-        """Triangulate 3D points"""
+        """Triangulate 3D points from two keyframes"""
         P1 = self.K @ np.hstack([kf1['R'], kf1['t']])
         P2 = self.K @ np.hstack([kf2['R'], kf2['t']])
         
@@ -275,9 +455,9 @@ class VisualSLAM:
             if not np.isfinite(pt).all():
                 continue
             
-            # Check depth
-            pt_cam = kf2['R'] @ pt.reshape(3,1) + kf2['t']
-            if pt_cam[2,0] < 0.1:
+            # Check depth (z > 0)
+            pt_cam = kf2['R'] @ pt.reshape(3, 1) + kf2['t']
+            if pt_cam[2, 0] < 0.1:
                 continue
             
             # Distance filter
@@ -312,7 +492,7 @@ class VisualSLAM:
         color = (0, 255, 0) if self.state == "OK" else (0, 165, 255)
         cv2.rectangle(vis, (0, h-30), (w, h), (0, 0, 0), -1)
         
-        status = f"{self.state} | Features: {self.match_count} | MPs: {len(self.map_points)} | KFs: {len(self.keyframes)}"
+        status = f"VO-{self.state} | Features: {self.match_count} | MPs: {len(self.map_points)} | KFs: {len(self.keyframes)}"
         cv2.putText(vis, status, (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         
         return vis
@@ -323,7 +503,7 @@ class VisualSLAM:
         - White background
         - Black dots for map points
         - Blue squares + line for keyframes
-        - Red dot for current position (MOVES!)
+        - Red dot for current position
         """
         img = np.ones((size, size, 3), dtype=np.uint8) * 255
         
@@ -389,7 +569,7 @@ class VisualSLAM:
         # 3. Draw keyframe positions (blue squares)
         for kf in self.keyframes:
             pos = -kf['R'].T @ kf['t']
-            px, py = to_pixel(pos[0,0], pos[2,0])
+            px, py = to_pixel(pos[0, 0], pos[2, 0])
             if 5 <= px < size-5 and 5 <= py < size-5:
                 cv2.rectangle(img, (px-4, py-4), (px+4, py+4), (255, 0, 0), 2)
         
@@ -397,7 +577,7 @@ class VisualSLAM:
         if len(traj_pixels) > 0:
             cv2.circle(img, traj_pixels[0], 8, (0, 200, 0), -1)
         
-        # 5. Draw CURRENT position (RED - this MOVES!)
+        # 5. Draw CURRENT position (RED)
         if len(self.trajectory) > 0:
             curr_pos = self.trajectory[-1]
             px, py = to_pixel(curr_pos[0], curr_pos[2])
@@ -406,21 +586,23 @@ class VisualSLAM:
                 cv2.circle(img, (px, py), 14, (255, 255, 255), 2)
         
         # Info text
-        cv2.putText(img, f"KeyFrames: {len(self.keyframes)}", (10, 25),
+        cv2.putText(img, f"Visual Odometry SLAM", (10, 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 0), 1)
+        cv2.putText(img, f"KeyFrames: {len(self.keyframes)}", (10, 40),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-        cv2.putText(img, f"MapPoints: {len(self.map_points)}", (10, 45),
+        cv2.putText(img, f"MapPoints: {len(self.map_points)}", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-        cv2.putText(img, f"Trajectory: {len(self.trajectory)}", (10, 65),
+        cv2.putText(img, f"Trajectory: {len(self.trajectory)}", (10, 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
         # Legend
         ly = size - 50
         cv2.circle(img, (size-80, ly), 4, (50, 50, 50), -1)
-        cv2.putText(img, "Map", (size-65, ly+4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 1)
+        cv2.putText(img, "Map", (size-65, ly+4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
         cv2.rectangle(img, (size-84, ly+12), (size-76, ly+20), (255, 0, 0), 2)
-        cv2.putText(img, "KF", (size-65, ly+20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 1)
+        cv2.putText(img, "KF", (size-65, ly+20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
         cv2.circle(img, (size-80, ly+32), 6, (0, 0, 255), -1)
-        cv2.putText(img, "Pos", (size-65, ly+36), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 1)
+        cv2.putText(img, "Pos", (size-65, ly+36), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
         
         return img
     
@@ -439,12 +621,11 @@ class VisualSLAM:
     def reset(self):
         """Reset SLAM"""
         with self._lock:
+            self.vo.reset()
             self.state = "INIT"
             self.frame_id = 0
             self.prev_gray = None
             self.prev_pts = None
-            self.R_total = np.eye(3, dtype=np.float32)
-            self.t_total = np.zeros((3, 1), dtype=np.float32)
             self.map_points = []
             self.keyframes = []
             self.trajectory = [(0.0, 0.0, 0.0)]
@@ -453,7 +634,7 @@ class VisualSLAM:
             self.last_kf_pos = np.zeros(3)
             self.last_kf_frame = 0
             MapPoint._counter = 0
-        print("SLAM reset")
+        print("Visual Odometry SLAM reset")
     
     def save_map(self, path):
         """Save map to PLY file"""

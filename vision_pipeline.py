@@ -33,6 +33,20 @@ class VisionPipeline:
         self.last_obstacles = []
         self.obstacle_history = deque(maxlen=3)
 
+    def detect(self, frame, conf=0.35):
+        """
+        YOLO nesne tespiti - Basit wrapper metodu.
+        Sesli mod ve klavye modunda aynı şekilde kullanılabilir.
+        
+        Args:
+            frame: OpenCV görüntüsü
+            conf: Confidence threshold (varsayılan 0.35)
+        
+        Returns:
+            YOLO results listesi
+        """
+        return self.model(frame, verbose=False, conf=conf)
+
     def init_ipm(self, width, height):
         """
         IPM (Inverse Perspective Mapping) matrisini hesaplar.

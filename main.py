@@ -1,3 +1,50 @@
+# === ALSA/JACK LOG KİRLİLİĞİNİ KAPAT ===
+# PyAudio/PortAudio kullanırken oluşan gereksiz ALSA/JACK uyarılarını susturur
+import os
+import sys
+import ctypes
+
+# ALSA hata mesajlarını sustur (Linux)
+try:
+    # libasound2 yükle ve hata handler'ını değiştir
+    ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                                          ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+    def py_error_handler(filename, line, function, err, fmt):
+        pass  # Hiçbir şey yapma - sessiz kal
+    
+    c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
+    asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+    asound.snd_lib_error_set_handler(c_error_handler)
+except:
+    pass  # Linux değilse veya libasound yoksa atla
+
+# JACK hata mesajlarını sustur - stderr'i /dev/null'a yönlendir
+# Bu daha agresif ama JACK mesajlarını susturmanın tek yolu
+class DevNull:
+    def write(self, msg):
+        pass
+    def flush(self):
+        pass
+
+# Orijinal stderr'i sakla (gerekirse geri almak için)
+_original_stderr = sys.stderr
+
+def suppress_audio_errors():
+    """Ses kütüphanelerinin stderr çıktılarını sustur"""
+    try:
+        # /dev/null'a yönlendir (Linux)
+        devnull = open('/dev/null', 'w')
+        os.dup2(devnull.fileno(), 2)  # stderr = fd 2
+    except:
+        pass
+
+def restore_stderr():
+    """Orijinal stderr'i geri yükle"""
+    sys.stderr = _original_stderr
+
+# Pygame ve PyAudio yüklemeden önce hataları sustur
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+
 import cv2
 import numpy as np
 # from ultralytics import YOLO  # Artık VisionPipeline içinde
@@ -7,8 +54,11 @@ from radar_navigation import RadarNavigation
 import threading
 from queue import Queue
 import time
-import os
 from gtts import gTTS
+
+# Ses kütüphaneleri import edilmeden önce JACK hatalarını sustur
+suppress_audio_errors()
+
 import pygame
 import uuid
 import tempfile
@@ -20,6 +70,7 @@ from services.object_searcher import search_object, get_available_objects
 from services import voice_chat  # MOD 5: Sesli AI Sohbet
 from services import image_qa  # MOD 6: Görsel Soru-Cevap (Gemini)
 from services import slam_mapper  # MOD 7: 3D Harita (SLAM)
+from services import voice_command  # Sesli Komut Sistemi
 
 # --- RASPBERRY PI CAMERA MODULE V3 İÇİN SINIF ---
 # 64-bit Bookworm için Picamera2 kullanır
@@ -36,7 +87,7 @@ class PiCameraReader:
     Raspberry Pi Camera Module v3 için optimized reader.
     Picamera2 kullanarak OpenCV uyumlu frame'ler sağlar.
     """
-    def __init__(self, camera_num=0, width=640, height=480):
+    def __init__(self, camera_num=0, width=1280, height=720):
         self.width = width
         self.height = height
         self.running = False
@@ -58,8 +109,20 @@ class PiCameraReader:
             self.picam2.configure(config)
             self.picam2.start()
             
-            # İlk kareyi al
-            time.sleep(0.5)  # Kamera stabilizasyonu
+            # === AUTOFOCUS AYARLARI (Pi Camera Module v3) ===
+            try:
+                from libcamera import controls
+                # Surekli autofocus - kamera surekli odaklanir
+                self.picam2.set_controls({
+                    "AfMode": controls.AfModeEnum.Continuous,
+                    "AfSpeed": controls.AfSpeedEnum.Fast
+                })
+                print("[OK] Autofocus: Surekli mod aktif")
+            except Exception as e:
+                print(f"[UYARI] Autofocus ayarlanamadi: {e}")
+            
+            # İlk kareyi al - autofocus icin biraz daha bekle
+            time.sleep(1.0)  # Kamera + autofocus stabilizasyonu
             self.latest_frame = self.picam2.capture_array()
             self.running = True
             
@@ -79,10 +142,9 @@ class PiCameraReader:
         while self.running:
             try:
                 frame = self.picam2.capture_array()
-                # RGB -> BGR dönüşümü (OpenCV için)
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # RGB olarak kalsin (donusum yok)
                 with self.lock:
-                    self.latest_frame = frame_bgr
+                    self.latest_frame = frame
             except Exception as e:
                 print(f"Kare yakalama hatası: {e}")
                 time.sleep(0.01)
@@ -341,6 +403,9 @@ def speak_text_temp(text, lang='tr'):
         
         # Thread-safe ses çalma
         with _speech_lock:
+            # Mixer başlatılmamışsa başlat
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
             pygame.mixer.music.load(temp_file)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
@@ -435,12 +500,22 @@ def play_sound(command):
     filepath = os.path.join(AUDIO_DIR, f"{command}.mp3")
     if os.path.exists(filepath):
         try:
+            # Mixer başlatılmamışsa başlat
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
             pygame.mixer.music.load(filepath)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
                 time.sleep(0.1)
         except Exception as e:
             print(f"Ses çalma hatası: {e}")
+            # Mixer'ı yeniden başlatmayı dene
+            try:
+                pygame.mixer.quit()
+                pygame.mixer.init()
+            except:
+                pass
+
 
 def speech_worker():
     """
@@ -1602,5 +1677,806 @@ def main():
     print("Program basariyla sonlandirildi.")
 
 
+def main_voice_controlled():
+    """
+    SESLİ KONTROLLÜ ANA FONKSİYON
+    Tüm modlar sesli komutlarla kontrol edilir.
+    
+    MOD SEÇİMİ:
+      - "navigasyon" -> Mod 1
+      - "metin" -> Mod 2
+      - "tanıma" -> Mod 3
+      - "arama" -> Mod 4
+      - "sohbet" -> Mod 5
+      - "soru" -> Mod 6
+      - "harita" -> Mod 7
+    
+    GENEL KOMUTLAR:
+      - "çık" -> Mod menüsüne dön
+      - "kapat" -> Programı kapat
+    
+    MOD ÖZELLİKLERİ:
+      - Mod 2: "çek" -> OCR okuma
+      - Mod 4: "[nesne] ara" -> Nesne ara
+      - Mod 5: Sesli sohbet (direkt konuşma)
+      - Mod 6: "çek" -> Fotoğraf çek, sonra soru sor
+    """
+    global speech_thread_running, mode_manager
+    
+    print("=" * 60)
+    print("    GÖRME ENGELLİ ASİSTANI - SESLİ KONTROL")
+    print("=" * 60)
+    print("\nSESLİ KOMUTLAR:")
+    print("  'navigasyon' - Navigasyon Modu")
+    print("  'metin'      - Metin Okuma Modu")
+    print("  'tanıma'     - Nesne Tanıma Modu")
+    print("  'arama'      - Nesne Arama Modu")
+    print("  'sohbet'     - Sesli AI Sohbet Modu")
+    print("  'soru'       - Görsel Soru-Cevap Modu")
+    print("  'harita'     - 3D Haritalama Modu")
+    print("  'kapat'      - Programı Kapat")
+    print("-" * 60)
+    
+    # Ses dosyalarını oluştur
+    print("\nSes dosyalari hazirlaniyor...")
+    create_audio_files()
+    
+    # Ses thread'ini başlat
+    print("Ses sistemi baslatiliyor...")
+    speech_thread_running = True
+    speech_thread = threading.Thread(target=speech_worker, daemon=True)
+    speech_thread.start()
+    
+    # Sesli komut sistemini başlat
+    print("Sesli komut sistemi baslatiliyor...")
+    if not voice_command.init():
+        print("[HATA] Sesli komut sistemi baslatilamadi!")
+        print("  Mikrofon kontrol edin ve pyaudio yuklu oldugundan emin olun.")
+        print("  Program klavye kontrolu ile devam edecek...")
+        main()  # Fallback to keyboard control
+        return
+    
+    print("[OK] Sesli komut sistemi hazir!")
+    
+    # Test sesi
+    speak_text_async("Sistem hazır. Mod seçmek için komut verin.")
+    time.sleep(2)
+    
+    # Kamerayı aç
+    print("\nKamera açılıyor...")
+    cap = None
+    
+    if PICAMERA_AVAILABLE:
+        try:
+            print("Pi Camera Module v3 deneniyor...")
+            cap = PiCameraReader(camera_num=0, width=1280, height=720)
+            print("[OK] Pi Camera basariyla baslatildi!")
+        except Exception as e:
+            print(f"[UYARI] Pi Camera baslatilamadi: {e}")
+            cap = None
+    
+    if cap is None or not cap.isOpened():
+        print("USB/Varsayılan kamera deneniyor...")
+        cap = LatestFrameReader(0)
+        if not cap.isOpened():
+            print("[HATA] Kamera acilamadi!")
+            return
+    
+    # Vision Pipeline
+    print("Vision Pipeline baslatiliyor...")
+    try:
+        pipeline = VisionPipeline("../models/yolo11n.pt")
+        print("[OK] Pipeline hazir!")
+    except Exception as e:
+        print(f"[HATA] Pipeline baslatma hatasi: {e}")
+        cap.release()
+        return
+    
+    # 3D Navigasyon Haritası
+    nav_map = NavigationMap(grid_size=(80, 80), cell_size=0.1)
+    depth_estimator = DepthEstimator()
+    
+    # RADAR NAVİGASYON SİSTEMİ
+    radar = RadarNavigation(radar_size=400)
+    print("[OK] Radar navigasyon sistemi hazir!")
+    
+    # Cooldown değişkenleri
+    speech_cooldown = 0
+    danger_cooldown = 0
+    
+    # ========== ANA DÖNGÜ ==========
+    running = True
+    current_mode = 0  # 0 = mod seçim menüsü
+    search_target = None
+    frame_count = 0
+    
+    print("\n" + "=" * 60)
+    print("    MOD SEÇİM MENÜSÜ - SESLİ KOMUT BEKLENİYOR")
+    print("=" * 60)
+    speak_text_async("Mod seçin. Navigasyon, metin, tanıma, arama, sohbet, soru veya harita deyin.")
+    
+    while running:
+        # Kamera frame al
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.01)
+            continue
+        
+        frame_count += 1
+        
+        # ============================================================
+        # MOD 0: MOD SEÇİM MENÜSÜ
+        # ============================================================
+        if current_mode == 0:
+            # Görüntü göster
+            display_frame = frame.copy()
+            cv2.rectangle(display_frame, (10, 10), (500, 60), (0, 0, 0), -1)
+            cv2.putText(display_frame, "MOD SECIM MENUSU - Sesli komut verin", (20, 45),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.imshow("Gorme Engelli Asistani", display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            
+            # Sesli komut dinle (non-blocking şekilde)
+            if frame_count % 30 == 0:  # Her 30 frame'de bir dinle
+                cmd_type, cmd_value = voice_command.wait_for_mode()
+                
+                if cmd_type == 'shutdown':
+                    speak_text_async("Program kapatılıyor. Hoşça kalın!")
+                    time.sleep(2)
+                    running = False
+                    break
+                
+                elif cmd_type == 'mode':
+                    current_mode = cmd_value
+                    mode_manager.switch_mode(current_mode)
+                    print(f"\n[OK] MOD {current_mode}: {mode_manager.get_mode_name()} AKTIF")
+                    speech_queue.put(f"MOD_{current_mode}")
+                    
+                    # Mod 7 için SLAM başlat
+                    if current_mode == 7:
+                        slam_mapper.init()
+                    
+                    # Mod 5 için ayrı döngüye git
+                    if current_mode == 5:
+                        cv2.destroyAllWindows()
+                        run_voice_chat_mode()
+                        current_mode = 0  # Geri dön
+                        speak_text_async("Mod menüsüne döndük. Yeni mod seçin.")
+                        continue
+                    
+                    time.sleep(1)
+            
+            continue
+        
+        # ============================================================
+        # MOD 1: NAVİGASYON (KLAVYE MODUYLA AYNI)
+        # ============================================================
+        elif current_mode == 1:
+            height, width = frame.shape[:2]
+            
+            # Vision Pipeline ile işle (YOLO + Zemin Tespiti + IPM)
+            combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
+            
+            # Free Space Overlay
+            free_space_overlay = np.zeros_like(bev_view)
+            free_space_overlay[free_space_mask > 0] = [0, 255, 0]
+            bev_combined = cv2.addWeighted(bev_view, 0.7, free_space_overlay, 0.3, 0)
+            
+            # Engelleri topla
+            obstacles = []
+            for item in pipeline_obstacles:
+                x1, y1, x2, y2, class_name, confidence = item
+                
+                # Bounding box'ı frame sınırları içinde tut
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                obstacles.append((x1, y1, x2, y2))
+                
+                # Mesafe tahmini
+                bbox_height = y2 - y1
+                distance, dist_category = estimate_distance(y2, height, bbox_height)
+                if dist_category in ["YAKIN", "COK_YAKIN"]:
+                    box_color = (0, 0, 255)  # Kırmızı
+                elif dist_category == "ORTA":
+                    box_color = (0, 165, 255)  # Turuncu
+                else:
+                    box_color = (0, 255, 0)  # Yeşil
+                
+                # Bounding box çiz
+                cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
+                
+                # Label pozisyonu
+                label = f"{class_name}: {distance:.1f}m"
+                label_y = y1 - 5 if y1 > 20 else y2 + 15
+                cv2.putText(combined_view, label, (x1, label_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+            
+            # En yakın engeli bul
+            min_distance, closest_category, closest_bbox = get_closest_obstacle(obstacles, height)
+            
+            # === RADAR NAVİGASYON SİSTEMİ ===
+            radar_obstacles = []
+            for item in pipeline_obstacles:
+                x1, y1, x2, y2, class_name, confidence = item
+                bbox_height = y2 - y1
+                dist, _ = estimate_distance(y2, height, bbox_height)
+                radar_obstacles.append((x1, y1, x2, y2, class_name, dist))
+            
+            # Radar'ı güncelle
+            radar_img, radar_direction, radar_info = radar.process_frame(
+                radar_obstacles, 
+                width, 
+                height
+            )
+            
+            # RADAR YÖN KOMUTUNU KULLAN
+            raw_direction = radar_direction
+            direction = stabilize_direction(raw_direction)
+            
+            # Cooldown azalt
+            if speech_cooldown > 0:
+                speech_cooldown -= 1
+            if danger_cooldown > 0:
+                danger_cooldown -= 1
+            
+            # === AKILLI YÖNLENDİRME SİSTEMİ ===
+            orta_engel_var = False
+            engel_bolge = None
+            if closest_bbox is not None:
+                cx = (closest_bbox[0] + closest_bbox[2]) // 2
+                left_end = width // 3
+                right_start = 2 * width // 3
+                
+                if cx < left_end:
+                    engel_bolge = "SOL"
+                elif cx > right_start:
+                    engel_bolge = "SAG"
+                else:
+                    engel_bolge = "ORTA"
+                    orta_engel_var = True
+            
+            smart_nav.add_direction(direction)
+            
+            # Kaçış yönü hesapla
+            kacis_yonu = None
+            if direction in ["SOL", "HAFIF_SOL"]:
+                kacis_yonu = "SOL"
+            elif direction in ["SAG", "HAFIF_SAG"]:
+                kacis_yonu = "SAG"
+            
+            # ACİL DURUMLAR
+            is_emergency = False
+            emergency_command = None
+            
+            if closest_category == "COK_YAKIN" and orta_engel_var:
+                is_emergency = True
+                if kacis_yonu == "SOL":
+                    emergency_command = "DUR_SOL"
+                elif kacis_yonu == "SAG":
+                    emergency_command = "DUR_SAG"
+                else:
+                    emergency_command = "DUR_GERI"
+            elif direction == "DUR":
+                is_emergency = True
+                if engel_bolge == "SOL":
+                    emergency_command = "ENGEL_SOL"
+                elif engel_bolge == "SAG":
+                    emergency_command = "ENGEL_SAG"
+                else:
+                    emergency_command = "DUR_GERI"
+            elif closest_category == "YAKIN" and orta_engel_var and min_distance and min_distance < 2.0:
+                is_emergency = True
+                if kacis_yonu == "SOL":
+                    emergency_command = "YAKIN_SOL"
+                elif kacis_yonu == "SAG":
+                    emergency_command = "YAKIN_SAG"
+                else:
+                    emergency_command = "YAKIN"
+            
+            # Acil durum seslendirme
+            if is_emergency and danger_cooldown <= 0:
+                while not speech_queue.empty():
+                    try: speech_queue.get_nowait()
+                    except: pass
+                speech_queue.put(emergency_command)
+                danger_cooldown = 40
+                speech_cooldown = 40
+                smart_nav.last_command = emergency_command
+                smart_nav.last_command_time = frame_count
+                print(f"[ACIL] {emergency_command}")
+            
+            # Normal yönlendirme
+            elif not is_emergency:
+                speak_command = smart_nav.update_state(direction, frame_count)
+                
+                if speak_command and speech_cooldown <= 0:
+                    while not speech_queue.empty():
+                        try: speech_queue.get_nowait()
+                        except: pass
+                    speech_queue.put(speak_command)
+                    speech_cooldown = 30
+                    print(f"[YON] {speak_command}")
+            
+            # Görselleştirme
+            combined_view = draw_regions(combined_view, direction)
+            
+            # MOD bilgisi ekle
+            cv2.rectangle(combined_view, (10, 10), (400, 50), (0, 0, 0), -1)
+            cv2.putText(combined_view, "MOD 1: NAVIGASYON (SESLI)", (20, 38),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # Mesafe bilgisi
+            if min_distance is not None:
+                dist_color = (0, 0, 255) if closest_category in ["YAKIN", "COK_YAKIN"] else (0, 255, 255) if closest_category == "ORTA" else (0, 255, 0)
+                cv2.putText(combined_view, f"Mesafe: {min_distance:.1f}m", (10, height - 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, dist_color, 2)
+            
+            cv2.putText(combined_view, f"Engel: {len(obstacles)}", (10, height - 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # TÜM PENCERELERİ GÖSTER (KLAVYE MODUYLA AYNI)
+            cv2.imshow("Navigasyon - MOD 1", combined_view)
+            cv2.imshow("Kus Bakisi (BEV)", bev_combined)
+            cv2.imshow("RADAR Navigasyon", radar_img)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            
+            # Sesli komut kontrolü
+            if frame_count % 60 == 0:
+                action, value = voice_command.wait_for_action(1)
+                if action == 'exit':
+                    current_mode = 0
+                    cv2.destroyAllWindows()
+                    speak_text_async("Mod menüsüne döndük.")
+                elif action == 'shutdown':
+                    running = False
+        
+        # ============================================================
+        # MOD 2: METİN OKUMA
+        # ============================================================
+        elif current_mode == 2:
+            if not ocr_reader.initialized:
+                ocr_reader.init()
+            
+            display_frame = frame.copy()
+            cv2.rectangle(display_frame, (10, 10), (400, 50), (0, 0, 0), -1)
+            cv2.putText(display_frame, "MOD 2: METIN OKUMA [Cek=Oku]", (20, 38),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            if hasattr(mode_manager, 'last_ocr_text') and mode_manager.last_ocr_text:
+                cv2.rectangle(display_frame, (10, 60), (630, 120), (0, 100, 0), -1)
+                short_text = mode_manager.last_ocr_text[:60] + "..." if len(mode_manager.last_ocr_text) > 60 else mode_manager.last_ocr_text
+                cv2.putText(display_frame, f"Okunan: {short_text}", (20, 95),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            cv2.imshow("Metin Okuma - MOD 2", display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            elif key == ord(' '):  # Klavye ile de çekilebilsin
+                text = read_text(frame.copy())
+                if text:
+                    mode_manager.last_ocr_text = text
+                    print(f"[OK] METIN: {text}")
+                    speak_text_async(text)
+                else:
+                    speak_text_async("Metin bulunamadı")
+            
+            # Sesli komut kontrolü
+            if frame_count % 45 == 0:
+                action, value = voice_command.wait_for_action(2)
+                if action == 'exit':
+                    current_mode = 0
+                    cv2.destroyAllWindows()
+                    speak_text_async("Mod menüsüne döndük.")
+                elif action == 'shutdown':
+                    running = False
+                elif action == 'capture':
+                    print("[OCR] Çek komutu alındı...")
+                    speak_text_async("Metin okunuyor")
+                    text = read_text(frame.copy())
+                    if text:
+                        mode_manager.last_ocr_text = text
+                        print(f"[OK] METIN: {text}")
+                        speak_text_async(text)
+                    else:
+                        speak_text_async("Metin bulunamadı")
+        
+        # ============================================================
+        # MOD 3: NESNE TANIMA (KLAVYE MODUYLA AYNI)
+        # ============================================================
+        elif current_mode == 3:
+            height, width = frame.shape[:2]
+            
+            # Vision Pipeline ile işle
+            combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
+            
+            # Engelleri işle ve çiz
+            for item in pipeline_obstacles:
+                x1, y1, x2, y2, class_name, confidence = item
+                
+                # Bounding box sınırları
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Mesafe tahmini
+                bbox_height = y2 - y1
+                distance, dist_category = estimate_distance(y2, height, bbox_height)
+                
+                # Renk (mesafeye göre)
+                if dist_category in ["YAKIN", "COK_YAKIN"]:
+                    box_color = (0, 0, 255)
+                elif dist_category == "ORTA":
+                    box_color = (0, 165, 255)
+                else:
+                    box_color = (0, 255, 0)
+                
+                # Türkçe isim
+                turkish_label = get_turkish_name(class_name)
+                
+                # Bounding box çiz
+                cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
+                label = f"{turkish_label}: {distance:.1f}m"
+                label_y = y1 - 5 if y1 > 20 else y2 + 15
+                cv2.putText(combined_view, label, (x1, label_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+            
+            # Her 3 saniyede nesneleri seslendir (klavye modundaki gibi)
+            if not hasattr(mode_manager, 'last_describe_time'):
+                mode_manager.last_describe_time = 0
+            
+            if frame_count - mode_manager.last_describe_time > 90:
+                mode_manager.last_describe_time = frame_count
+                description = describe_objects(pipeline_obstacles, width, height)
+                print(f"[NESNE] {description}")
+                speak_text_async(description)
+            
+            # MOD bilgisi ekle
+            cv2.rectangle(combined_view, (10, 10), (400, 50), (0, 0, 0), -1)
+            cv2.putText(combined_view, "MOD 3: NESNE TANIMA (SESLI)", (20, 38),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+            
+            # Nesne sayısı
+            cv2.putText(combined_view, f"Tespit: {len(pipeline_obstacles)} nesne", (10, height - 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            cv2.imshow("Nesne Tanima - MOD 3", combined_view)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            
+            # Sesli komut kontrolü
+            if frame_count % 60 == 0:
+                action, value = voice_command.wait_for_action(3)
+                if action == 'exit':
+                    current_mode = 0
+                    cv2.destroyAllWindows()
+                    speak_text_async("Mod menüsüne döndük.")
+                elif action == 'shutdown':
+                    running = False
+        
+        # ============================================================
+        # MOD 4: NESNE ARAMA (KLAVYE MODUYLA AYNI)
+        # ============================================================
+        elif current_mode == 4:
+            height, width = frame.shape[:2]
+            
+            if search_target is None:
+                # Hedef sor (sadece ilk seferde)
+                if not hasattr(mode_manager, 'search_prompt_shown') or not mode_manager.search_prompt_shown:
+                    speak_text_async("Aramak istediğiniz nesneyi söyleyin, sonra ara deyin.")
+                    mode_manager.search_prompt_shown = True
+            
+            # Vision Pipeline ile işle
+            combined_view, pipeline_obstacles, edges, bev_view, free_space_mask = pipeline.process_frame(frame)
+            
+            # Engelleri işle ve çiz
+            for item in pipeline_obstacles:
+                x1, y1, x2, y2, class_name, confidence = item
+                
+                # Bounding box sınırları
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Mesafe tahmini
+                bbox_height = y2 - y1
+                distance, dist_category = estimate_distance(y2, height, bbox_height)
+                
+                # Aranan nesne mi kontrol et
+                is_target = False
+                if search_target:
+                    if search_target.lower() in class_name.lower() or class_name.lower() in search_target.lower():
+                        is_target = True
+                
+                # Renk (aranan nesne kırmızı, diğerleri yeşil)
+                if is_target:
+                    box_color = (0, 0, 255)  # Kırmızı - bulundu!
+                    cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 3)
+                    cv2.putText(combined_view, f"BULUNDU: {class_name} ({distance:.1f}m)", (x1, y1-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
+                else:
+                    box_color = (0, 255, 0)
+                    cv2.rectangle(combined_view, (x1, y1), (x2, y2), box_color, 2)
+                    cv2.putText(combined_view, f"{class_name}: {distance:.1f}m", (x1, y1-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+            
+            # Arama sonuçlarını seslendir (klavye modundaki gibi)
+            if not hasattr(mode_manager, 'last_search_time'):
+                mode_manager.last_search_time = 0
+            
+            if search_target and frame_count - mode_manager.last_search_time > 60:
+                mode_manager.last_search_time = frame_count
+                
+                # pipeline_obstacles'a mesafe bilgisi ekle
+                obstacles_with_distance = []
+                for item in pipeline_obstacles:
+                    x1, y1, x2, y2, class_name, confidence = item
+                    bbox_height = y2 - y1
+                    dist, _ = estimate_distance(y2, height, bbox_height)
+                    obstacles_with_distance.append((x1, y1, x2, y2, class_name, confidence, dist))
+                
+                # Artık her zaman sonuç döner (bulunamadı dahil)
+                result = search_object(obstacles_with_distance, search_target, width, height, report_not_found=True)
+                if result:
+                    print(f"[ARAMA] {result}")
+                    speak_text_async(result)
+            
+            # MOD bilgisi ekle
+            cv2.rectangle(combined_view, (10, 10), (450, 50), (0, 0, 0), -1)
+            target_text = search_target if search_target else "Hedef yok"
+            cv2.putText(combined_view, f"MOD 4: ARAMA - {target_text}", (20, 38),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+            
+            # Arama hedefini ekranda göster
+            if search_target:
+                cv2.putText(combined_view, f"Araniyor: {search_target}", (10, 80),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+            cv2.imshow("Nesne Arama - MOD 4", combined_view)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            
+            # Sesli komut kontrolü
+            if frame_count % 45 == 0:
+                action, value = voice_command.wait_for_action(4)
+                if action == 'exit':
+                    current_mode = 0
+                    search_target = None
+                    mode_manager.search_prompt_shown = False
+                    cv2.destroyAllWindows()
+                    speak_text_async("Mod menüsüne döndük.")
+                elif action == 'shutdown':
+                    running = False
+                elif action == 'search':
+                    search_target = value
+                    print(f"[ARAMA] Yeni hedef: {search_target}")
+                    speak_text_async(f"{search_target} aranıyor")
+                elif action == 'set_target':
+                    search_target = value
+                    print(f"[ARAMA] Hedef ayarlandı: {search_target}")
+        
+        # ============================================================
+        # MOD 6: GÖRSEL SORU-CEVAP (KLAVYE MODUYLA AYNI)
+        # ============================================================
+        elif current_mode == 6:
+            # Modül hazır mı kontrol et (lazy loading)
+            if not image_qa.is_ready():
+                if not image_qa.init():
+                    print("[HATA] Gorsel soru-cevap baslatilamadi!")
+                    speak_text_async("Görsel soru cevap başlatılamadı")
+                    current_mode = 0
+                    continue
+                else:
+                    speak_text_async("Görsel soru cevap hazır. Boşluk tuşuna basın veya çek deyin.")
+            
+            display_frame = frame.copy()
+            
+            # MOD bilgisi ekle
+            cv2.rectangle(display_frame, (10, 10), (500, 50), (0, 0, 0), -1)
+            cv2.putText(display_frame, "MOD 6: GORSEL SORU-CEVAP (SESLI)", (20, 38),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+            
+            # Kullanım bilgisi
+            cv2.putText(display_frame, "Bosluk: Yazili soru | 'cek': Sesli soru", (10, 80),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            cv2.imshow("Gorsel Soru-Cevap - MOD 6", display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            
+            # BOŞLUK TUŞU: YAZILI SORU SOR (klavye modundaki gibi)
+            elif key == ord(' '):
+                if image_qa.is_ready():
+                    print("\n" + "=" * 50)
+                    print("Fotograf cekiliyor...")
+                    
+                    # Mevcut frame'i kaydet
+                    current_frame = frame.copy()
+                    
+                    # Terminalde soru al
+                    print("Sorunuzu yazin:")
+                    question = input("SORU: ").strip()
+                    
+                    if question:
+                        print("Dusunuluyor...")
+                        speak_text_async("Düşünüyorum")
+                        
+                        answer = image_qa.process_query(current_frame, question)
+                        print(f"\n[CEVAP] {answer}")
+                        print("=" * 50 + "\n")
+                        speak_text_async(answer)
+                    else:
+                        print("Soru girilmedi.")
+            
+            # Sesli komut kontrolü
+            if frame_count % 45 == 0:
+                action, value = voice_command.wait_for_action(6)
+                if action == 'exit':
+                    current_mode = 0
+                    cv2.destroyAllWindows()
+                    speak_text_async("Mod menüsüne döndük.")
+                elif action == 'shutdown':
+                    running = False
+                elif action == 'capture':
+                    speak_text_async("Fotoğraf çekildi. Sorunuzu sorun.")
+                    captured_frame = frame.copy()
+                    
+                    # Soru dinle
+                    time.sleep(1)
+                    success, question = voice_command.listen(timeout=10, phrase_limit=20)
+                    if success and question:
+                        print(f"[SORU] {question}")
+                        speak_text_async("Düşünüyorum")
+                        
+                        # Gemini'ye sor
+                        if not image_qa.is_ready():
+                            image_qa.init()
+                        answer = image_qa.process_query(captured_frame, question)
+                        print(f"[CEVAP] {answer}")
+                        speak_text_async(answer)
+                elif action == 'speech':
+                    # Direkt soru sorulmuş
+                    question = value
+                    speak_text_async("Düşünüyorum")
+                    if not image_qa.is_ready():
+                        image_qa.init()
+                    answer = image_qa.process_query(frame.copy(), question)
+                    print(f"[CEVAP] {answer}")
+                    speak_text_async(answer)
+        
+        # ============================================================
+        # MOD 7: 3D HARİTALAMA (KLAVYE MODUYLA AYNI)
+        # ============================================================
+        elif current_mode == 7:
+            # SLAM frame işle
+            success = slam_mapper.process_frame(frame)
+            
+            # SLAM görselleştirmesi al (frame üzerine çizim)
+            slam_vis = slam_mapper.get_visualization(frame)
+            
+            # Kuş bakışı harita al
+            topdown = slam_mapper.get_topdown_map()
+            
+            # İstatistikleri al
+            stats = slam_mapper.get_stats()
+            
+            # MOD bilgisi ekle
+            cv2.rectangle(slam_vis, (10, 10), (450, 80), (0, 0, 0), -1)
+            cv2.putText(slam_vis, f"MOD 7: 3D HARITA (SESLI)", (20, 35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+            cv2.putText(slam_vis, f"Noktalar: {stats.get('mps', 0)} | Keyframe: {stats.get('kfs', 0)}", (20, 65),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Pencereleri göster (klavye modundaki gibi 2 pencere)
+            cv2.imshow("SLAM Kamera", slam_vis)
+            cv2.imshow("SLAM Harita", topdown)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                running = False
+                break
+            
+            # BOŞLUK TUŞU: Haritayı kaydet (klavye modundaki gibi)
+            elif key == ord(' '):
+                maps_dir = os.path.join(os.path.dirname(__file__), "maps")
+                os.makedirs(maps_dir, exist_ok=True)
+                filepath = os.path.join(maps_dir, f"room_map_{int(time.time())}.ply")
+                if slam_mapper.save_map(filepath):
+                    print(f"[OK] Harita kaydedildi: {filepath}")
+                    speak_text_async("Harita kaydedildi")
+                else:
+                    print("[HATA] Harita kaydedilemedi (yeterli nokta yok)")
+                    speak_text_async("Harita kaydedilemedi")
+            
+            # L TUŞU: Harita yükle
+            elif key == ord('l'):
+                maps_dir = os.path.join(os.path.dirname(__file__), "maps")
+                if os.path.exists(maps_dir):
+                    ply_files = [f for f in os.listdir(maps_dir) if f.endswith('.ply')]
+                    if ply_files:
+                        latest = sorted(ply_files)[-1]
+                        filepath = os.path.join(maps_dir, latest)
+                        if slam_mapper.load_map(filepath):
+                            print(f"[OK] Harita yuklendi: {latest}")
+                            speak_text_async("Harita yüklendi")
+                        else:
+                            print("[HATA] Harita yuklenemedi")
+                    else:
+                        print("[HATA] Kayitli harita bulunamadi")
+                        speak_text_async("Kayıtlı harita yok")
+            
+            # R TUŞU: Haritayı sıfırla
+            elif key == ord('r'):
+                slam_mapper.reset()
+                print("SLAM sifirlanadi")
+                speak_text_async("Harita sıfırlandı")
+            
+            # I TUŞU: İstatistikler
+            elif key == ord('i'):
+                print(f"\nSLAM Istatistikleri:")
+                print(f"   Toplam Nokta: {stats.get('mps', 0)}")
+                print(f"   Keyframe: {stats.get('kfs', 0)}")
+                print(f"   Kamera Pozisyonu: {stats.get('pos', (0,0,0))}")
+            
+            # Sesli komut kontrolü
+            if frame_count % 60 == 0:
+                action, value = voice_command.wait_for_action(7)
+                if action == 'exit':
+                    current_mode = 0
+                    cv2.destroyAllWindows()
+                    speak_text_async("Mod menüsüne döndük.")
+                elif action == 'shutdown':
+                    running = False
+    
+    # Temizlik
+    speech_thread_running = False
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    if image_qa.is_ready():
+        image_qa.cleanup()
+    
+    print("\nProgram basariyla sonlandirildi.")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--keyboard":
+        # Klavye kontrollü eski mod
+        main()
+    else:
+        # Sesli kontrollü yeni mod (varsayılan)
+        main_voice_controlled()

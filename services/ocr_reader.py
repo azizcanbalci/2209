@@ -74,6 +74,19 @@ TURKISH_DICTIONARY = {
     # Eylemler
     'ac', 'kapat', 'basla', 'bitir', 'gel', 'git', 'al', 'ver', 'yap',
     'oku', 'yaz', 'dinle', 'konus', 'bak', 'gör', 'duy', 'hisset',
+    
+    # Yiyecek/icecek
+    'su', 'suyu', 'kaynak', 'dogal', 'dogal', 'maden', 'soda', 'kola',
+    'cay', 'kahve', 'süt', 'ayran', 'meyve', 'sebze', 'ekmek', 'peynir',
+    'et', 'tavuk', 'balik', 'yumurta', 'seker', 'tuz', 'yag',
+    'sise', 'litre', 'ml', 'gram', 'kg', 'bardak', 'paket',
+    
+    # Doga
+    'orman', 'dag', 'deniz', 'göl', 'nehir', 'cay', 'pinar', 'selalale',
+    'yesil', 'mavi', 'temiz', 'saf', 'taze', 'organik',
+    
+    # Markalar ve urunler
+    'marka', 'ürün', 'fiyat', 'indirim', 'kampanya', 'bedava', 'ücretsiz',
 }
 
 
@@ -107,6 +120,102 @@ def clean_ocr_output(text):
     words = [w for w in words if any(c.isalnum() for c in w)]
     
     return ' '.join(words)
+
+
+def is_meaningful_word(word):
+    """
+    Bir kelimenin anlamli olup olmadigini kontrol et.
+    Anlamsiz OCR hatalarini tespit eder.
+    """
+    if not word:
+        return False
+    
+    # Temizle
+    clean_word = re.sub(r'[^\w]', '', word).lower()
+    
+    if not clean_word:
+        return False
+    
+    # 1. Cok kisa kelimeler (1-2 karakter) - sadece bilinen kisaltmalari kabul et
+    if len(clean_word) <= 2:
+        allowed_short = {'ve', 'su', 'su', 'de', 'da', 'ki', 'mi', 'mu', 'bu', 'o', 'i'}
+        return clean_word in allowed_short
+    
+    # 2. Turkce sozlukte var mi?
+    if clean_word in TURKISH_DICTIONARY:
+        return True
+    
+    # 3. Sesli harf kontrolu - Turkce kelimelerde sesli harf olmali
+    vowels = set('aeıioöuüAEIİOÖUÜ')
+    vowel_count = sum(1 for c in clean_word if c in vowels)
+    consonant_count = len(clean_word) - vowel_count
+    
+    # Sesli harf yok veya cok az = anlamsiz
+    if vowel_count == 0:
+        return False
+    
+    # Sessiz/sesli orani cok yuksek = muhtemelen anlamsiz (ornek: "Vk", "Wth")
+    if consonant_count > 0 and vowel_count > 0:
+        ratio = consonant_count / vowel_count
+        if ratio > 4:  # 4'ten fazla sessiz harf/sesli harf = anlamsiz
+            return False
+    
+    # 4. Turkce'de olmayan karakter kombinasyonlari
+    non_turkish_patterns = [
+        r'[wxqWXQ]',  # Turkce'de bu harfler yok
+        r'^[bcdfghjklmnprsstvyz]{3,}',  # 3+ sessiz harf ile baslayan
+        r'[bcdfghjklmnprsstvyz]{4,}',  # 4+ ardisik sessiz harf
+    ]
+    for pattern in non_turkish_patterns:
+        if re.search(pattern, clean_word, re.IGNORECASE):
+            return False
+    
+    # 5. Sayi + harf karisimi (ornek: "4Wath") - genelde anlamsiz
+    if re.search(r'\d+[a-zA-Z]+', word) or re.search(r'[a-zA-Z]+\d+[a-zA-Z]+', word):
+        return False
+    
+    # 6. Sadece sayi ise - anlamli olabilir (fiyat, tarih vs)
+    if clean_word.isdigit():
+        return True
+    
+    # 7. Uzun kelimeler icin ek kontrol
+    if len(clean_word) >= 4:
+        # En az 1 sesli harf her 3 karakterde olmali
+        # Ornek: "kaynak" = k-a-y-n-a-k (sesli harfler 2. ve 5. pozisyonda)
+        return True
+    
+    # 3 harfli kelimeler - sesli harf varsa kabul et
+    if len(clean_word) == 3 and vowel_count >= 1:
+        return True
+    
+    return False
+
+
+def filter_meaningful_text(text):
+    """
+    OCR ciktisindaki anlamsiz kelimeleri filtrele.
+    Sadece anlamli kelimeleri birak.
+    """
+    if not text:
+        return text
+    
+    words = text.split()
+    meaningful_words = []
+    
+    for word in words:
+        # Noktalama isaretlerini ayir
+        clean_word = re.sub(r'[^\w\s]', '', word)
+        
+        if is_meaningful_word(clean_word):
+            meaningful_words.append(word)
+    
+    result = ' '.join(meaningful_words)
+    
+    # Sonuc cok kisa ise bos dondur
+    if len(result.strip()) < 2:
+        return None
+    
+    return result.strip()
 
 
 class OCRReader:
@@ -187,44 +296,52 @@ class OCRReader:
                 return False
 
     def preprocess(self, frame):
-        """Goruntu on isleme - OCR icin optimize"""
-        # Gri tonlama
+        """
+        Goruntu on isleme - OCR icin optimize
+        Basit ve guvenilir yaklasim
+        """
+        # Gri tonlama - RGB ve BGR destegi
         if len(frame.shape) == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Renk uzayi kontrolu - RGB mi BGR mi?
+            # Eger kirmizi kanal daha yogunsa muhtemelen RGB
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         else:
             gray = frame.copy()
         
         # Boyut kontrolu - cok kucukse buyut
         h, w = gray.shape[:2]
-        if w < 640:
-            scale = 640 / w
-            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        if w < 800:
+            scale = 800 / w
+            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
         
-        # Gurultu azaltma
-        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        # Hafif gurultu azaltma (cok agresif olmasin!)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
         
         # Kontrast artir (CLAHE)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray = clahe.apply(gray)
         
-        # Adaptif esikleme (metin icin en iyi sonuc)
-        binary = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11, 2
-        )
-        
-        # Morfolojik islemler - gurultu temizleme
-        kernel = np.ones((1, 1), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        # Otsu threshold - otomatik esik degeri bulur (daha guvenilir)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
         return binary
+    
+    def preprocess_simple(self, frame):
+        """
+        Cok basit on isleme - sadece gri tonlama
+        Karmasik arka planlar icin
+        """
+        if len(frame.shape) == 3:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = frame.copy()
+        
+        return gray
 
     def read(self, frame, use_preprocess=True):
         """
         OCR ile metin oku
-        frame: BGR numpy array (OpenCV formati)
+        frame: RGB veya BGR numpy array
         use_preprocess: On isleme uygula
         Returns: Okunan metin string veya None
         """
@@ -237,19 +354,15 @@ class OCRReader:
             if use_preprocess:
                 img = self.preprocess(frame)
             else:
-                # Sadece gri tonlama
-                if len(frame.shape) == 3:
-                    img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                else:
-                    img = frame
+                # Basit on isleme
+                img = self.preprocess_simple(frame)
             
             # Tesseract konfigurasyonu
             # PSM modlari:
-            # 3 = Fully automatic page segmentation (default)
+            # 3 = Fully automatic page segmentation (default) - EN GUVENILIR
             # 6 = Assume a single uniform block of text
-            # 7 = Treat the image as a single text line
-            # 11 = Sparse text
-            config = f'--oem 3 --psm 6 -l {self.lang}'
+            # 11 = Sparse text (dagnik metin)
+            config = f'--oem 3 --psm 3 -l {self.lang}'
             
             # OCR calistir
             text = self.tesseract.image_to_string(img, config=config)
@@ -258,6 +371,9 @@ class OCRReader:
                 # Temizle ve duzelt
                 text = clean_ocr_output(text)
                 text = fix_turkish_text(text)
+                
+                # Anlamsiz kelimeleri filtrele
+                text = filter_meaningful_text(text)
                 
                 if text and len(text.strip()) > 1:
                     print(f"[OCR] Sonuc: {text}")

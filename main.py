@@ -89,6 +89,9 @@ class PiCameraReader:
     """
     Raspberry Pi Camera Module v3 için HIGH-PERFORMANCE reader.
     Dahili 90/180/270 derece döndürme desteği içerir.
+    
+    NOT: Picamera2 Transform sadece 0 ve 180 derece destekler.
+    90 ve 270 derece için yazılımsal (OpenCV) döndürme kullanılır.
     """
     def __init__(self, camera_num=0, width=640, height=480, fast_mode=True, rotation=0):
         self.width = width
@@ -102,6 +105,14 @@ class PiCameraReader:
         self.fps_time = time.time()
         self.current_fps = 0
         
+        # Yazılımsal döndürme gerekiyor mu? (90 veya 270 derece için)
+        self.software_rotation = rotation in [90, 270]
+        self.cv_rotation_code = None
+        if rotation == 90:
+            self.cv_rotation_code = cv2.ROTATE_90_CLOCKWISE
+        elif rotation == 270:
+            self.cv_rotation_code = cv2.ROTATE_90_COUNTERCLOCKWISE
+        
         if not PICAMERA_AVAILABLE:
             raise RuntimeError("Picamera2 kurulu değil!")
         
@@ -110,8 +121,12 @@ class PiCameraReader:
             self.picam2 = Picamera2(camera_num)
             
             # === DONANIMSEL DÖNDÜRME AYARI ===
-            # rotation=90 (sağa), rotation=270 (sola)
-            camera_transform = Transform(rotation=self.rotation)
+            # Sadece 0 ve 180 derece donanımsal destekleniyor
+            # 90 ve 270 için Transform kullanmıyoruz (yazılımsal yapacağız)
+            if rotation == 180:
+                camera_transform = Transform(hflip=True, vflip=True)  # 180 derece
+            else:
+                camera_transform = Transform()  # Döndürme yok (90/270 yazılımsal yapılacak)
             
             # === YÜKSEK PERFORMANS YAPILANDIRMASI ===
             if fast_mode:
@@ -120,7 +135,7 @@ class PiCameraReader:
                     main={"size": (width, height), "format": "RGB888"},
                     buffer_count=4,
                     queue=False,
-                    transform=camera_transform  # Dönüşüm burada uygulanır
+                    transform=camera_transform
                 )
             else:
                 # Kalite modu
@@ -152,17 +167,21 @@ class PiCameraReader:
             except Exception as e:
                 print(f"[UYARI] Autofocus ayarlanamadi: {e}")
             
-            # İlk kareyi yakala
+            # İlk kareyi yakala ve döndür
             time.sleep(0.5)
-            self.latest_frame = self.picam2.capture_array("main")
+            frame = self.picam2.capture_array("main")
+            if self.software_rotation and self.cv_rotation_code is not None:
+                frame = cv2.rotate(frame, self.cv_rotation_code)
+            self.latest_frame = frame
             self.running = True
             
             # Arka plan thread'i başlat
             self.thread = threading.Thread(target=self._update, daemon=True)
             self.thread.start()
             
+            rotation_type = "yazilimsal" if self.software_rotation else "donanimsal"
             print(f"[OK] Pi Camera {camera_num} baslatildi ({width}x{height})")
-            print(f"[INFO] Rotation: {rotation} derece | Fast Mode: {fast_mode}")
+            print(f"[INFO] Rotation: {rotation} derece ({rotation_type}) | Fast Mode: {fast_mode}")
             
         except Exception as e:
             print(f"[HATA] Pi Camera baslatma hatasi: {e}")
@@ -170,10 +189,15 @@ class PiCameraReader:
             raise
 
     def _update(self):
-        """Arka planda sürekli kare yakala"""
+        """Arka planda sürekli kare yakala ve gerekirse döndür"""
         while self.running:
             try:
                 frame = self.picam2.capture_array("main")
+                
+                # Yazılımsal döndürme (90 veya 270 derece için)
+                if self.software_rotation and self.cv_rotation_code is not None:
+                    frame = cv2.rotate(frame, self.cv_rotation_code)
+                
                 with self.lock:
                     self.latest_frame = frame
                 
@@ -188,7 +212,7 @@ class PiCameraReader:
                 time.sleep(0.005)
 
     def read(self):
-        """En son kareyi döndür"""
+        """En son kareyi döndür (zaten döndürülmüş halde)"""
         with self.lock:
             if self.latest_frame is not None:
                 return True, self.latest_frame

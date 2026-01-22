@@ -1397,7 +1397,7 @@ def main():
             
             # FPS göster
             current_fps = fps_counter.update()
-            draw_fps(display_frame, current_fps, (width - 120, 30))
+            draw_fps(display_frame, current_fps, (frame_width - 120, 30))
             
             # Sadece tek pencere göster
             cv2.imshow("Metin Okuma - MOD 2", display_frame)
@@ -1731,21 +1731,21 @@ def main():
         # ============================================================
         if current_mode == 1:
             # NAVİGASYON: Tüm pencereler + FPS
-            draw_fps(combined_view, current_fps, (width - 120, 30))
+            draw_fps(combined_view, current_fps, (frame_width - 120, 30))
             cv2.imshow("Navigasyon - MOD 1", combined_view)
             cv2.imshow("Kus Bakisi (BEV)", bev_combined)
             cv2.imshow("RADAR Navigasyon", radar_img)
         elif current_mode == 3:
             # NESNE TANIMA: Sadece ana görüntü + FPS
-            draw_fps(combined_view, current_fps, (width - 120, 30))
+            draw_fps(combined_view, current_fps, (frame_width - 120, 30))
             cv2.imshow("Nesne Tanima - MOD 3", combined_view)
         elif current_mode == 4:
             # NESNE ARAMA: Sadece ana görüntü + FPS
-            draw_fps(combined_view, current_fps, (width - 120, 30))
+            draw_fps(combined_view, current_fps, (frame_width - 120, 30))
             cv2.imshow("Nesne Arama - MOD 4", combined_view)
         elif current_mode == 6:
             # GÖRSEL SORU-CEVAP: Sadece ana görüntü + FPS
-            draw_fps(combined_view, current_fps, (width - 120, 30))
+            draw_fps(combined_view, current_fps, (frame_width - 120, 30))
             cv2.imshow("Gorsel Soru-Cevap - MOD 6", combined_view)
         
         # TUŞ KONTROLLERI

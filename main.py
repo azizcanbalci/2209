@@ -1239,9 +1239,10 @@ def main():
     # Önce Pi Camera dene (Raspberry Pi'de)
     if PICAMERA_AVAILABLE:
         try:
-            print("Pi Camera Module v3 deneniyor (Port 0)...")
-            cap = PiCameraReader(camera_num=0, width=640, height=480)
-            print("[OK] Pi Camera basariyla baslatildi!")
+            print("Pi Camera Module v3 deneniyor (Port 0, 90 derece dondurme)...")
+            # Gozluge yatay monte edilen kamera icin 90 derece saat yonunde dondurme
+            cap = PiCameraReader(camera_num=0, width=640, height=480, rotation=90)
+            print("[OK] Pi Camera basariyla baslatildi! (Rotation: 90 derece)")
         except Exception as e:
             print(f"[UYARI] Pi Camera baslatilamadi: {e}")
             cap = None
@@ -1937,10 +1938,11 @@ def main_voice_controlled():
     
     if PICAMERA_AVAILABLE:
         try:
-            print("Pi Camera Module v3 deneniyor (FAST MODE)...")
+            print("Pi Camera Module v3 deneniyor (FAST MODE + 90 derece dondurme)...")
+            # Gozluge yatay monte edilen kamera icin 90 derece saat yonunde dondurme
             # 640x480 + fast_mode = maksimum FPS
-            cap = PiCameraReader(camera_num=0, width=640, height=480, fast_mode=True)
-            print(f"[OK] Pi Camera basariyla baslatildi! (FPS: ~{cap.get_fps()})")
+            cap = PiCameraReader(camera_num=0, width=640, height=480, fast_mode=True, rotation=90)
+            print(f"[OK] Pi Camera basariyla baslatildi! (Rotation: 90, FPS: ~{cap.get_fps()})")
         except Exception as e:
             print(f"[UYARI] Pi Camera baslatilamadi: {e}")
             cap = None

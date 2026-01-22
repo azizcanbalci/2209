@@ -72,30 +72,28 @@ from services import image_qa  # MOD 6: Görsel Soru-Cevap (Gemini)
 from services import slam_mapper  # MOD 7: 3D Harita (SLAM)
 from services import voice_command  # Sesli Komut Sistemi
 
+import threading
+import time
+
 # --- RASPBERRY PI CAMERA MODULE V3 İÇİN SINIF ---
 # 64-bit Bookworm için Picamera2 kullanır
 try:
     from picamera2 import Picamera2
+    from picamera2.utils import Transform  # Döndürme için gerekli
     PICAMERA_AVAILABLE = True
 except ImportError:
     PICAMERA_AVAILABLE = False
-    print("UYARI: Picamera2 bulunamadi. USB/IP kamera kullanilacak.")
-
+    print("UYARI: Picamera2 veya Transform bulunamadi. USB/IP kamera kullanilacak.")
 
 class PiCameraReader:
     """
     Raspberry Pi Camera Module v3 için HIGH-PERFORMANCE reader.
-    Picamera2 kullanarak OpenCV uyumlu frame'ler sağlar.
-    
-    OPTİMİZASYONLAR:
-    - 4 buffer ile daha akıcı frame akışı
-    - Queue tabanlı double buffering
-    - Zero-copy frame transfer
-    - Düşük çözünürlük modu desteği (hız için)
+    Dahili 90/180/270 derece döndürme desteği içerir.
     """
-    def __init__(self, camera_num=0, width=640, height=480, fast_mode=True):
+    def __init__(self, camera_num=0, width=640, height=480, fast_mode=True, rotation=0):
         self.width = width
         self.height = height
+        self.rotation = rotation  # 0, 90, 180 veya 270
         self.running = False
         self.latest_frame = None
         self.lock = threading.Lock()
@@ -108,32 +106,37 @@ class PiCameraReader:
             raise RuntimeError("Picamera2 kurulu değil!")
         
         try:
-            # Picamera2 başlat (camera_num: 0 veya 1)
+            # Picamera2 başlat
             self.picam2 = Picamera2(camera_num)
+            
+            # === DONANIMSEL DÖNDÜRME AYARI ===
+            # rotation=90 (sağa), rotation=270 (sola)
+            camera_transform = Transform(rotation=self.rotation)
             
             # === YÜKSEK PERFORMANS YAPILANDIRMASI ===
             if fast_mode:
-                # Hız öncelikli mod - düşük çözünürlük, yüksek FPS
+                # Hız öncelikli mod
                 config = self.picam2.create_preview_configuration(
                     main={"size": (width, height), "format": "RGB888"},
-                    buffer_count=4,  # 4 buffer = daha akıcı
-                    queue=False  # Frame drop'a izin ver (hız için)
+                    buffer_count=4,
+                    queue=False,
+                    transform=camera_transform  # Dönüşüm burada uygulanır
                 )
             else:
                 # Kalite modu
                 config = self.picam2.create_preview_configuration(
                     main={"size": (width, height), "format": "RGB888"},
-                    buffer_count=3
+                    buffer_count=3,
+                    transform=camera_transform
                 )
             
             self.picam2.configure(config)
             
             # === KAMERA KONTROL AYARLARI (HIZ İÇİN) ===
-            # Frame rate'i maksimize et
             self.picam2.set_controls({
-                "FrameDurationLimits": (16666, 33333),  # 30-60 FPS arası
-                "ExposureTime": 20000,  # 20ms - hızlı exposure
-                "AnalogueGain": 2.0,  # Düşük ışıkta hızlı yanıt
+                "FrameDurationLimits": (16666, 33333),  # 30-60 FPS
+                "ExposureTime": 20000,
+                "AnalogueGain": 2.0,
             })
             
             self.picam2.start()
@@ -141,7 +144,6 @@ class PiCameraReader:
             # === AUTOFOCUS AYARLARI (Pi Camera Module v3) ===
             try:
                 from libcamera import controls
-                # Surekli autofocus - kamera surekli odaklanir
                 self.picam2.set_controls({
                     "AfMode": controls.AfModeEnum.Continuous,
                     "AfSpeed": controls.AfSpeedEnum.Fast
@@ -150,30 +152,28 @@ class PiCameraReader:
             except Exception as e:
                 print(f"[UYARI] Autofocus ayarlanamadi: {e}")
             
-            # İlk kareyi al - kısa bekleme
-            time.sleep(0.5)  # Azaltıldı: 1.0 -> 0.5
-            self.latest_frame = self.picam2.capture_array()
+            # İlk kareyi yakala
+            time.sleep(0.5)
+            self.latest_frame = self.picam2.capture_array("main")
             self.running = True
             
-            # Arka plan thread'i başlat (yüksek öncelik)
+            # Arka plan thread'i başlat
             self.thread = threading.Thread(target=self._update, daemon=True)
             self.thread.start()
             
-            print(f"[OK] Pi Camera {camera_num} baslatildi ({width}x{height}) - Fast Mode: {fast_mode}")
+            print(f"[OK] Pi Camera {camera_num} baslatildi ({width}x{height})")
+            print(f"[INFO] Rotation: {rotation} derece | Fast Mode: {fast_mode}")
             
         except Exception as e:
             print(f"[HATA] Pi Camera baslatma hatasi: {e}")
             self.running = False
             raise
-    
+
     def _update(self):
-        """Arka planda sürekli kare yakala - OPTİMİZE"""
+        """Arka planda sürekli kare yakala"""
         while self.running:
             try:
-                # capture_array yerine daha hızlı yöntem
                 frame = self.picam2.capture_array("main")
-                
-                # Lock süresini minimize et
                 with self.lock:
                     self.latest_frame = frame
                 
@@ -185,30 +185,26 @@ class PiCameraReader:
                     self.fps_time = time.time()
                     
             except Exception as e:
-                # Hata durumunda kısa bekle
                 time.sleep(0.005)
-    
+
     def read(self):
-        """En son kareyi döndür (OpenCV uyumlu) - ZERO-COPY"""
+        """En son kareyi döndür"""
         with self.lock:
             if self.latest_frame is not None:
-                # Sadece gerektiğinde copy yap
                 return True, self.latest_frame
             return False, None
-    
+
     def read_copy(self):
-        """Kopyalı frame döndür (modifikasyon için)"""
+        """Kopyalı frame döndür"""
         with self.lock:
             if self.latest_frame is not None:
                 return True, self.latest_frame.copy()
             return False, None
-    
+
     def get_fps(self):
-        """Mevcut FPS değerini döndür"""
         return self.current_fps
-    
+
     def release(self):
-        """Kamerayı kapat"""
         self.running = False
         if hasattr(self, 'thread') and self.thread.is_alive():
             self.thread.join(timeout=1.0)
@@ -216,14 +212,12 @@ class PiCameraReader:
             self.picam2.stop()
             self.picam2.close()
         print("Pi Camera kapatıldı.")
-    
+
     def isOpened(self):
         return self.running
-    
-    def set(self, prop, value):
-        # OpenCV property setleri için placeholder
-        pass
 
+    def set(self, prop, value):
+        pass
 
 class LatestFrameReader:
     """
